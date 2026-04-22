@@ -211,7 +211,7 @@ func (m model) View() string {
 
 	// Заголовок
 	titleStyle := centerStyle.Foreground(titleColor).Bold(true)
-	lines = append(lines, titleStyle.Render("━━━ Загрузчик модов Valheim ━━━"))
+	lines = append(lines, titleStyle.Render(tuiTitle))
 	lines = append(lines, "")
 
 	// Статус
