@@ -431,7 +431,21 @@ func cleanDir(base, rel string, keep map[string]struct{}) {
 	}
 }
 
+func sanityCheck() error {
+	if localSubpath == "" || localSubpath == "." || filepath.IsAbs(localSubpath) || strings.Contains(localSubpath, "..") {
+		return fmt.Errorf("unsafe localSubpath constant: %q", localSubpath)
+	}
+	if _, err := os.Stat(gameExecutable); err != nil {
+		return fmt.Errorf("%s не найден рядом с WUR.exe — запусти из корня папки Windrose", gameExecutable)
+	}
+	return nil
+}
+
 func main() {
+	if err := sanityCheck(); err != nil {
+		fmt.Fprintln(os.Stderr, "Ошибка:", err)
+		os.Exit(1)
+	}
 	if _, err := tea.NewProgram(newModel()).Run(); err != nil {
 		log.Fatal(err)
 	}
