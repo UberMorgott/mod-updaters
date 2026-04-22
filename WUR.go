@@ -306,7 +306,7 @@ func connectAndListFiles() tea.Msg {
 		}
 
 		relPath := strings.TrimPrefix(entry.Path, remoteDir)
-		localPath := filepath.Join(localDir, relPath)
+		localPath := filepath.Join(localDir, localSubpath, relPath)
 
 		local, err := os.Stat(localPath)
 		if os.IsNotExist(err) || (err == nil && needsUpdate(local, entry.Info)) {
@@ -341,7 +341,7 @@ func (m *model) downloadNext() tea.Cmd {
 		}
 
 		relPath := strings.TrimPrefix(file.Path, remoteDir)
-		localPath := filepath.Join(localDir, relPath)
+		localPath := filepath.Join(localDir, localSubpath, relPath)
 
 		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 			return errorMsg{err}
