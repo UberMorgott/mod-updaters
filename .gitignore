@@ -1,0 +1,13 @@
+# Build artefacts
+*.bak
+*.tmp
+
+# Editor local state
+.vscode/
+.idea/
+
+# Go build cache
+*.test
+*.out
+
+# NOTE: uar.exe and wur.exe are NOT ignored — they are the shipped payload.
