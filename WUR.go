@@ -385,28 +385,28 @@ func (m *model) syncAndLaunch() tea.Cmd {
 	return func() tea.Msg {
 		defer m.closeConnections()
 
-		// Создаём директории
+		// Создаём директории внутри ~mods
 		for _, e := range m.allEntries {
 			if e.Info.IsDir() {
 				relPath := strings.TrimPrefix(e.Path, remoteDir)
-				os.MkdirAll(filepath.Join(localDir, relPath), 0755)
+				if relPath == "" {
+					continue
+				}
+				os.MkdirAll(filepath.Join(localDir, localSubpath, relPath), 0755)
 			}
 		}
 
-		// Чистим лишние файлы в plugins
-		localPlugins, _ := filepath.Abs(filepath.Join(localDir, pluginsSubPath))
-		remotePlugins := remoteDir + pluginsSubPath
-
+		// Полное зеркало ~mods: удаляем локальные файлы/папки, которых нет на сервере
+		localRoot, _ := filepath.Abs(filepath.Join(localDir, localSubpath))
 		remoteSet := make(map[string]struct{})
 		for _, e := range m.allEntries {
-			if rel, ok := strings.CutPrefix(e.Path, remotePlugins); ok {
-				rel = strings.TrimPrefix(rel, "/")
-				if rel != "" {
-					remoteSet[filepath.ToSlash(rel)] = struct{}{}
-				}
+			rel := strings.TrimPrefix(e.Path, remoteDir)
+			if rel == "" {
+				continue
 			}
+			remoteSet[filepath.ToSlash(rel)] = struct{}{}
 		}
-		cleanDir(localPlugins, "", remoteSet)
+		cleanDir(localRoot, "", remoteSet)
 
 		// Запуск игры
 		cmd := exec.Command("cmd", "/C", "start", "/B", "/high", gameExecutable, "-console")
