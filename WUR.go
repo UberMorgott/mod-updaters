@@ -353,29 +353,41 @@ func (m *model) downloadNext() tea.Cmd {
 		}
 		defer src.Close()
 
-		dst, err := os.Create(localPath)
+		tmpPath := localPath + ".tmp"
+		dst, err := os.Create(tmpPath)
 		if err != nil {
 			return errorMsg{err}
 		}
-		defer dst.Close()
 
 		buf := make([]byte, 128*1024)
 		for {
-			n, err := src.Read(buf)
+			n, rErr := src.Read(buf)
 			if n > 0 {
 				if _, wErr := dst.Write(buf[:n]); wErr != nil {
+					dst.Close()
+					os.Remove(tmpPath)
 					return errorMsg{wErr}
 				}
 				ch <- uint64(n)
 			}
-			if err == io.EOF {
+			if rErr == io.EOF {
 				break
 			}
-			if err != nil {
-				return errorMsg{err}
+			if rErr != nil {
+				dst.Close()
+				os.Remove(tmpPath)
+				return errorMsg{rErr}
 			}
 		}
 
+		if err := dst.Close(); err != nil {
+			os.Remove(tmpPath)
+			return errorMsg{err}
+		}
+		if err := os.Rename(tmpPath, localPath); err != nil {
+			os.Remove(tmpPath)
+			return errorMsg{fmt.Errorf("rename %s: %w", relPath, err)}
+		}
 		os.Chtimes(localPath, time.Now(), file.Info.ModTime())
 		return fileDownloadedMsg{}
 	}
