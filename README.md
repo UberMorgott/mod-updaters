@@ -12,7 +12,11 @@ Set the Steam launch option for the game once. On every "Play" press, `curl -z` 
 cmd /c "curl -sSfL -z wur.exe -R -o wur.exe https://raw.githubusercontent.com/UberMorgott/mod-updaters/main/wur.exe && wur.exe %command%"
 ```
 
-Syncs `/tmp/mnt/01DB6F2D5E1A6080/Windrose/` on the Keenetic SFTP into `Windrose\R5\Content\Paks\~mods\`. Full mirror — files missing remotely get deleted locally.
+Syncs `/tmp/mnt/01DB6F2D5E1A6080/Windrose/` on the Keenetic SFTP into the Windrose game install. Three managed roots (declared in `WUR.go` `syncSpecs`):
+
+- `paks/` → `Windrose\R5\Content\Paks\~mods\` — full mirror, deletes orphans (pak mods).
+- `ue4ss/` → `Windrose\R5\Binaries\Win64\ue4ss\` — full mirror, deletes orphans (UE4SS install + Lua mods).
+- `win64/` → `Windrose\R5\Binaries\Win64\` — additive only, never deletes (drops `dwmapi.dll` UE4SS proxy alongside game binaries).
 
 ### Valheim
 

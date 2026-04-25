@@ -24,10 +24,26 @@ const (
 	sftpPassword   = "Br2ctG7FGSqPhr4"
 	remoteDir      = "/tmp/mnt/01DB6F2D5E1A6080/Windrose/"
 	localDir       = "."
-	localSubpath   = "R5/Content/Paks/~mods"
 	gameExecutable = "Windrose.exe"
 	tuiTitle       = "━━━ Загрузчик модов Windrose ━━━"
 )
+
+// syncSpec maps a remote subdirectory under remoteDir to a local subpath
+// under localDir. fullMirror=true runs cleanDir to delete local files that
+// disappeared from remote; fullMirror=false only adds/updates and never
+// deletes (used when the local subpath contains files we do not own, e.g.
+// engine DLLs in R5/Binaries/Win64/).
+type syncSpec struct {
+	remoteSubdir string
+	localSubpath string
+	fullMirror   bool
+}
+
+var syncSpecs = []syncSpec{
+	{"paks", "R5/Content/Paks/~mods", true},
+	{"ue4ss", "R5/Binaries/Win64/ue4ss", true},
+	{"win64", "R5/Binaries/Win64", false},
+}
 
 // --- Базовые стили (без размеров) ---
 var (
@@ -42,6 +58,7 @@ var (
 type sftpEntry struct {
 	Path string
 	Info os.FileInfo
+	Spec syncSpec
 }
 
 type errorMsg struct{ err error }
@@ -271,6 +288,19 @@ func (m *model) closeConnections() {
 
 // --- Команды ---
 
+// localPathFor returns the local destination for a remote path, given the
+// spec it falls under. Path is relative to remoteDir+spec.remoteSubdir.
+func localPathFor(spec syncSpec, relUnderSpec string) string {
+	return filepath.Join(localDir, spec.localSubpath, relUnderSpec)
+}
+
+// relUnderSpec returns the path relative to remoteDir+spec.remoteSubdir.
+func relUnderSpec(spec syncSpec, fullPath string) string {
+	specRoot := strings.TrimSuffix(remoteDir, "/") + "/" + spec.remoteSubdir
+	r := strings.TrimPrefix(fullPath, specRoot)
+	return strings.TrimPrefix(r, "/")
+}
+
 func connectAndListFiles() tea.Msg {
 	sshCfg := &ssh.ClientConfig{
 		User:            sftpLogin,
@@ -293,25 +323,32 @@ func connectAndListFiles() tea.Msg {
 	var all, toDownload []sftpEntry
 	var totalSize uint64
 
-	walker := sftpClient.Walk(remoteDir)
-	for walker.Step() {
-		if walker.Err() != nil {
+	for _, spec := range syncSpecs {
+		specRoot := strings.TrimSuffix(remoteDir, "/") + "/" + spec.remoteSubdir
+		if _, err := sftpClient.Stat(specRoot); err != nil {
+			// Empty / missing remote subdir is fine — fullMirror specs will still
+			// run cleanDir against an empty keep-set and clear the local subpath.
 			continue
 		}
-		entry := sftpEntry{Path: walker.Path(), Info: walker.Stat()}
-		all = append(all, entry)
+		walker := sftpClient.Walk(specRoot)
+		for walker.Step() {
+			if walker.Err() != nil {
+				continue
+			}
+			entry := sftpEntry{Path: walker.Path(), Info: walker.Stat(), Spec: spec}
+			all = append(all, entry)
 
-		if entry.Info.IsDir() {
-			continue
-		}
+			if entry.Info.IsDir() {
+				continue
+			}
 
-		relPath := strings.TrimPrefix(entry.Path, remoteDir)
-		localPath := filepath.Join(localDir, localSubpath, relPath)
-
-		local, err := os.Stat(localPath)
-		if os.IsNotExist(err) || (err == nil && needsUpdate(local, entry.Info)) {
-			toDownload = append(toDownload, entry)
-			totalSize += uint64(entry.Info.Size())
+			rel := relUnderSpec(spec, entry.Path)
+			localPath := localPathFor(spec, rel)
+			local, err := os.Stat(localPath)
+			if os.IsNotExist(err) || (err == nil && needsUpdate(local, entry.Info)) {
+				toDownload = append(toDownload, entry)
+				totalSize += uint64(entry.Info.Size())
+			}
 		}
 	}
 
@@ -340,8 +377,8 @@ func (m *model) downloadNext() tea.Cmd {
 			return errorMsg{fmt.Errorf("нет SFTP соединения")}
 		}
 
-		relPath := strings.TrimPrefix(file.Path, remoteDir)
-		localPath := filepath.Join(localDir, localSubpath, relPath)
+		rel := relUnderSpec(file.Spec, file.Path)
+		localPath := localPathFor(file.Spec, rel)
 
 		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 			return errorMsg{err}
@@ -386,7 +423,7 @@ func (m *model) downloadNext() tea.Cmd {
 		}
 		if err := os.Rename(tmpPath, localPath); err != nil {
 			os.Remove(tmpPath)
-			return errorMsg{fmt.Errorf("rename %s: %w", relPath, err)}
+			return errorMsg{fmt.Errorf("rename %s: %w", rel, err)}
 		}
 		os.Chtimes(localPath, time.Now(), file.Info.ModTime())
 		return fileDownloadedMsg{}
@@ -397,28 +434,39 @@ func (m *model) syncAndLaunch() tea.Cmd {
 	return func() tea.Msg {
 		defer m.closeConnections()
 
-		// Создаём директории внутри ~mods
+		// Создаём директории-зеркала под каждый spec
 		for _, e := range m.allEntries {
-			if e.Info.IsDir() {
-				relPath := strings.TrimPrefix(e.Path, remoteDir)
-				if relPath == "" {
-					continue
-				}
-				os.MkdirAll(filepath.Join(localDir, localSubpath, relPath), 0755)
+			if !e.Info.IsDir() {
+				continue
 			}
-		}
-
-		// Полное зеркало ~mods: удаляем локальные файлы/папки, которых нет на сервере
-		localRoot, _ := filepath.Abs(filepath.Join(localDir, localSubpath))
-		remoteSet := make(map[string]struct{})
-		for _, e := range m.allEntries {
-			rel := strings.TrimPrefix(e.Path, remoteDir)
+			rel := relUnderSpec(e.Spec, e.Path)
 			if rel == "" {
 				continue
 			}
-			remoteSet[filepath.ToSlash(rel)] = struct{}{}
+			os.MkdirAll(localPathFor(e.Spec, rel), 0755)
 		}
-		cleanDir(localRoot, "", remoteSet)
+
+		// Полное зеркало для fullMirror specs: удаляем локальные файлы,
+		// которых нет на сервере. Для не-fullMirror specs (win64 → dwmapi.dll)
+		// просто оставляем локальное содержимое нетронутым.
+		for _, spec := range syncSpecs {
+			if !spec.fullMirror {
+				continue
+			}
+			keep := make(map[string]struct{})
+			for _, e := range m.allEntries {
+				if e.Spec.remoteSubdir != spec.remoteSubdir {
+					continue
+				}
+				rel := relUnderSpec(spec, e.Path)
+				if rel == "" {
+					continue
+				}
+				keep[filepath.ToSlash(rel)] = struct{}{}
+			}
+			localRoot, _ := filepath.Abs(filepath.Join(localDir, spec.localSubpath))
+			cleanDir(localRoot, "", keep)
+		}
 
 		// Запуск игры
 		cmd := exec.Command("cmd", "/C", "start", "/B", "/high", gameExecutable, "-console")
@@ -444,8 +492,13 @@ func cleanDir(base, rel string, keep map[string]struct{}) {
 }
 
 func sanityCheck() error {
-	if localSubpath == "" || localSubpath == "." || filepath.IsAbs(localSubpath) || strings.Contains(localSubpath, "..") {
-		return fmt.Errorf("unsafe localSubpath constant: %q", localSubpath)
+	for _, spec := range syncSpecs {
+		if spec.localSubpath == "" || spec.localSubpath == "." || filepath.IsAbs(spec.localSubpath) || strings.Contains(spec.localSubpath, "..") {
+			return fmt.Errorf("unsafe localSubpath in syncSpec: %q", spec.localSubpath)
+		}
+		if spec.remoteSubdir == "" || strings.Contains(spec.remoteSubdir, "..") || strings.HasPrefix(spec.remoteSubdir, "/") {
+			return fmt.Errorf("unsafe remoteSubdir in syncSpec: %q", spec.remoteSubdir)
+		}
 	}
 	if _, err := os.Stat(gameExecutable); err != nil {
 		return fmt.Errorf("%s не найден рядом с WUR.exe — запусти из корня папки Windrose", gameExecutable)
