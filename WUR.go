@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -21,7 +19,7 @@ import (
 
 // --- Конфигурация ---
 const (
-	wurVersion     = "0.2.0"
+	wurVersion     = "0.3.0"
 	sftpServer     = "morgott.keenetic.pro:22"
 	sftpLogin      = "modman"
 	sftpPassword   = "Br2ctG7FGSqPhr4"
@@ -29,58 +27,20 @@ const (
 	localDir       = "."
 	gameExecutable = "Windrose.exe"
 	tuiTitle       = "━━━ Загрузчик модов Windrose ━━━"
-
-	// mods.txt merge — special file at SFTP `ue4ss-mods/mods-additions.txt`,
-	// listing UE4SS mod-name lines (`<Name> : <0|1>`) WUR ensures registered
-	// in friend's local `R5/Binaries/Win64/ue4ss/Mods/mods.txt`.
-	modsAdditionsRemoteName = "mods-additions.txt"
-	modsTxtLocalSubpath     = "R5/Binaries/Win64/ue4ss/Mods/mods.txt"
 )
 
-// managedMods enumerates the mod folder names WUR is allowed to touch.
+// fullMirrorDirs lists local directories (relative to the game root) where WUR
+// applies full-mirror cleanup at the immediate-subdir level: any folder under
+// these paths that has NO matching folder on SFTP at the same relative path is
+// deleted recursively. Files at this exact level (e.g. mods.txt directly under
+// `ue4ss/Mods/`) are NEVER deleted by this pass — only direct subdirectories.
 //
-// Policy:
-//   - Folders in this list are FULL-MIRRORED from SFTP. If the folder
-//     disappears from `Z:\Windrose\paks\~mods\<X>` or `Z:\Windrose\ue4ss-mods\<X>`,
-//     it is DELETED from friend's local install on the next launch (propagating
-//     deletes — user's intent).
-//   - Folders NOT in this list are NEVER touched, regardless of SFTP state.
-//     This protects friend's other mods (Caites Map Tweaks, ConsoleEnabler,
-//     Keybinds, etc.) from being clobbered.
-//   - mods.txt entries: if a name in this list is in friend's mods.txt but no
-//     longer on SFTP, the entry is removed. Names NOT in this list are
-//     preserved verbatim.
-//
-// To start managing a new mod, append its folder name here, rebuild, push.
-// To stop managing a mod (leave it alone forever), remove from this list.
-var managedMods = []string{
-	"ShareMap",
-	"ShareMap-CPP",
-	"ShareShip",
-}
-
-// subtree maps an SFTP source subpath to a local target subpath.
-//
-// Each subtree's top-level folders that match a name in `managedMods` are
-// owned by WUR. Inside an owned folder, full-mirror semantics apply (any file
-// not on SFTP is deleted). Folders not in `managedMods` are left alone.
-var subtrees = []struct {
-	Name                    string
-	RemoteSubpath           string // relative to remoteDir, no trailing slash
-	LocalSubpath            string // relative to localDir, no trailing slash
-	HandleModsAdditionsFile bool   // if true, file `mods-additions.txt` at the subpath root drives the mods.txt merge
-}{
-	{
-		Name:          "paks",
-		RemoteSubpath: "paks/~mods",
-		LocalSubpath:  "R5/Content/Paks/~mods/~mods",
-	},
-	{
-		Name:                    "ue4ss-mods",
-		RemoteSubpath:           "ue4ss-mods",
-		LocalSubpath:            "R5/Binaries/Win64/ue4ss/Mods",
-		HandleModsAdditionsFile: true,
-	},
+// Outside of these two roots WUR is sync-only (file-level if-newer mirror,
+// never delete). This keeps `R5/Binaries/Win64/Windrose-Win64-Shipping.exe`,
+// the dwmapi/UE4SS dlls, and any random files the friend has under R5/ safe.
+var fullMirrorDirs = []string{
+	"R5/Binaries/Win64/ue4ss/Mods",
+	"R5/Content/Paks/~mods/~mods",
 }
 
 // --- Базовые стили (без размеров) ---
@@ -95,26 +55,19 @@ var (
 // --- Типы ---
 
 type sftpEntry struct {
-	RemotePath string
-	LocalPath  string
+	RemotePath string // absolute SFTP path
+	LocalPath  string // absolute local path
+	RelSlash   string // path relative to remoteDir / localDir, forward-slash form
 	Info       os.FileInfo
-}
-
-// subtreePresence records, per subtree, which managed mod-name folders exist on SFTP this run.
-type subtreePresence struct {
-	LocalSubpath string              // absolute path (resolved at sync time)
-	OnSFTP       map[string]struct{} // managed mod names that are present on SFTP for this subtree
 }
 
 type errorMsg struct{ err error }
 type filesListedMsg struct {
-	sftpClient   *sftp.Client
-	sshClient    *ssh.Client
-	files        []sftpEntry
-	allEntries   []sftpEntry
-	presence     []subtreePresence
-	modsAddLines []string
-	totalSize    uint64
+	sftpClient *sftp.Client
+	sshClient  *ssh.Client
+	files      []sftpEntry // files needing download
+	allEntries []sftpEntry // every SFTP entry seen (files + dirs) — used for cleanup keep-set
+	totalSize  uint64
 }
 type progressTickMsg struct{}
 type fileDownloadedMsg struct{}
@@ -127,8 +80,6 @@ type model struct {
 	progressChan                     chan uint64
 	status                           string
 	files, allEntries                []sftpEntry
-	presence                         []subtreePresence
-	modsAddLines                     []string
 	totalSize, downloaded            uint64
 	currentFileSize, currentFileDown uint64
 	currentIdx                       int
@@ -198,8 +149,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sshClient = msg.sshClient
 		m.files = msg.files
 		m.allEntries = msg.allEntries
-		m.presence = msg.presence
-		m.modsAddLines = msg.modsAddLines
 		m.totalSize = msg.totalSize
 		m.startTime = time.Now()
 		m.updateBarWidths()
@@ -332,23 +281,14 @@ func (m *model) closeConnections() {
 
 // --- Команды ---
 
-func remoteDirExists(c *sftp.Client, path string) bool {
-	st, err := c.Stat(path)
-	if err != nil {
-		return false
-	}
-	return st.IsDir()
+func needsUpdate(local, remote os.FileInfo) bool {
+	return local.Size() != remote.Size() ||
+		!local.ModTime().Truncate(time.Second).Equal(remote.ModTime().Truncate(time.Second))
 }
 
-func isManagedMod(name string) bool {
-	for _, m := range managedMods {
-		if strings.EqualFold(m, name) {
-			return true
-		}
-	}
-	return false
-}
-
+// connectAndListFiles walks the SFTP root recursively, mirroring `Z:\Windrose\`
+// to the local game directory 1:1. Every file under the SFTP root maps to the
+// same relative path locally.
 func connectAndListFiles() tea.Msg {
 	sshCfg := &ssh.ClientConfig{
 		User:            sftpLogin,
@@ -368,111 +308,49 @@ func connectAndListFiles() tea.Msg {
 		return errorMsg{fmt.Errorf("SFTP: %w", err)}
 	}
 
+	localRootAbs, _ := filepath.Abs(localDir)
+	remoteRoot := strings.TrimRight(remoteDir, "/")
+
 	var all, toDownload []sftpEntry
-	var presence []subtreePresence
-	var modsAddLines []string
 	var totalSize uint64
 
-	for _, st := range subtrees {
-		remoteRoot := strings.TrimRight(remoteDir, "/") + "/" + st.RemoteSubpath
-		localRootAbs, _ := filepath.Abs(filepath.Join(localDir, filepath.FromSlash(st.LocalSubpath)))
+	walker := sftpClient.Walk(remoteRoot)
+	for walker.Step() {
+		if walker.Err() != nil {
+			continue
+		}
+		rPath := walker.Path()
+		info := walker.Stat()
 
-		pres := subtreePresence{LocalSubpath: localRootAbs, OnSFTP: make(map[string]struct{})}
+		rel := strings.TrimPrefix(rPath, remoteRoot)
+		rel = strings.TrimPrefix(rel, "/")
+		if rel == "" {
+			continue
+		}
+		relSlash := filepath.ToSlash(rel)
 
-		if !remoteDirExists(sftpClient, remoteRoot) {
-			presence = append(presence, pres) // empty OnSFTP → all managed mods absent → all get cleaned
+		localPath := filepath.Join(localRootAbs, filepath.FromSlash(rel))
+		entry := sftpEntry{RemotePath: rPath, LocalPath: localPath, RelSlash: relSlash, Info: info}
+		all = append(all, entry)
+
+		if info.IsDir() {
 			continue
 		}
 
-		walker := sftpClient.Walk(remoteRoot)
-		for walker.Step() {
-			if walker.Err() != nil {
-				continue
-			}
-			rPath := walker.Path()
-			info := walker.Stat()
-
-			rel := strings.TrimPrefix(rPath, remoteRoot)
-			rel = strings.TrimPrefix(rel, "/")
-			if rel == "" {
-				continue
-			}
-
-			// Special file at the subtree root: drives mods.txt merge.
-			if st.HandleModsAdditionsFile && !info.IsDir() && rel == modsAdditionsRemoteName {
-				lines, ferr := readRemoteTextFile(sftpClient, rPath)
-				if ferr == nil {
-					modsAddLines = lines
-				}
-				continue
-			}
-
-			// Top-level segment under the subtree root = mod-name directory.
-			topSeg := rel
-			if i := strings.IndexByte(rel, '/'); i >= 0 {
-				topSeg = rel[:i]
-			}
-			if topSeg == "" {
-				continue
-			}
-			// Only sync managed mods. Anything else on SFTP is ignored — keeps the
-			// `managedMods` list as the single source of truth on the friend side.
-			if !isManagedMod(topSeg) {
-				continue
-			}
-			pres.OnSFTP[topSeg] = struct{}{}
-
-			localPath := filepath.Join(localRootAbs, filepath.FromSlash(rel))
-			entry := sftpEntry{RemotePath: rPath, LocalPath: localPath, Info: info}
-			all = append(all, entry)
-
-			if info.IsDir() {
-				continue
-			}
-
-			local, lerr := os.Stat(localPath)
-			if os.IsNotExist(lerr) || (lerr == nil && needsUpdate(local, info)) {
-				toDownload = append(toDownload, entry)
-				totalSize += uint64(info.Size())
-			}
+		local, lerr := os.Stat(localPath)
+		if os.IsNotExist(lerr) || (lerr == nil && needsUpdate(local, info)) {
+			toDownload = append(toDownload, entry)
+			totalSize += uint64(info.Size())
 		}
-
-		presence = append(presence, pres)
 	}
 
 	return filesListedMsg{
-		sftpClient:   sftpClient,
-		sshClient:    sshClient,
-		files:        toDownload,
-		allEntries:   all,
-		presence:     presence,
-		modsAddLines: modsAddLines,
-		totalSize:    totalSize,
+		sftpClient: sftpClient,
+		sshClient:  sshClient,
+		files:      toDownload,
+		allEntries: all,
+		totalSize:  totalSize,
 	}
-}
-
-func readRemoteTextFile(c *sftp.Client, path string) ([]string, error) {
-	f, err := c.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return nil, err
-	}
-	var out []string
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	for scanner.Scan() {
-		line := strings.TrimRight(scanner.Text(), "\r\n")
-		out = append(out, line)
-	}
-	return out, scanner.Err()
-}
-
-func needsUpdate(local, remote os.FileInfo) bool {
-	return local.Size() != remote.Size() ||
-		!local.ModTime().Truncate(time.Second).Equal(remote.ModTime().Truncate(time.Second))
 }
 
 func (m *model) downloadNext() tea.Cmd {
@@ -548,47 +426,22 @@ func (m *model) syncAndLaunch() tea.Cmd {
 	return func() tea.Msg {
 		defer m.closeConnections()
 
-		// Create directories under managed roots that exist on SFTP.
+		// Create directories that exist on SFTP (so empty dirs survive a sync).
 		for _, e := range m.allEntries {
 			if e.Info.IsDir() {
 				os.MkdirAll(e.LocalPath, 0755)
 			}
 		}
 
-		// Per-managed-mod cleanup (managed-list pattern).
-		//
-		// For each subtree:
-		//   1. For every directory entry directly under the local subtree root
-		//      whose name is in `managedMods`:
-		//        - If that mod is present on SFTP → full-mirror inside the
-		//          folder (delete files not on SFTP).
-		//        - If absent from SFTP → DELETE the whole folder (propagating
-		//          deletes — user removed the mod from the source).
-		//   2. Folders not in `managedMods` are NEVER touched.
-		keep := make(map[string]struct{})
-		for _, e := range m.allEntries {
-			abs, err := filepath.Abs(e.LocalPath)
-			if err != nil {
-				continue
-			}
-			keep[filepath.Clean(abs)] = struct{}{}
+		// Cleanup pass: for each fullMirrorDirs path, list immediate subdirs of
+		// the local copy. Any subdir whose corresponding SFTP path doesn't exist
+		// gets recursively deleted (propagates user's "I removed this mod").
+		// Files at this exact level are NEVER touched (mods.txt etc.).
+		localRootAbs, _ := filepath.Abs(localDir)
+		sftpDirs := buildSFTPDirSet(m.allEntries)
+		for _, mirror := range fullMirrorDirs {
+			cleanupFullMirror(localRootAbs, mirror, sftpDirs)
 		}
-
-		for _, pres := range m.presence {
-			cleanSubtreeManaged(pres.LocalSubpath, pres.OnSFTP, keep)
-		}
-
-		// mods.txt managed merge: ensure entries for every managed mod present
-		// on SFTP (the ue4ss-mods subtree); remove entries for managed mods
-		// absent from SFTP; preserve all unmanaged entries verbatim.
-		var ue4ssPresent map[string]struct{}
-		for _, p := range m.presence {
-			if strings.HasSuffix(filepath.ToSlash(p.LocalSubpath), "Win64/ue4ss/Mods") {
-				ue4ssPresent = p.OnSFTP
-				break
-			}
-		}
-		mergeModsTxt(m.modsAddLines, ue4ssPresent)
 
 		// Запуск игры
 		cmd := exec.Command("cmd", "/C", "start", "/B", "/high", gameExecutable, "-console")
@@ -598,181 +451,52 @@ func (m *model) syncAndLaunch() tea.Cmd {
 	}
 }
 
-// cleanSubtreeManaged enforces the managed-list policy on a subtree root.
-//
-// `localSubtree` is the absolute path of e.g. R5/Content/Paks/~mods/~mods.
-// `onSFTP` is the set of managed mod names present on SFTP for this subtree.
-// `keep` is the global set of absolute paths that must survive cleanup.
-func cleanSubtreeManaged(localSubtree string, onSFTP map[string]struct{}, keep map[string]struct{}) {
-	entries, err := os.ReadDir(localSubtree)
+// buildSFTPDirSet returns the set of forward-slash relative paths that are
+// directories on SFTP this run. Used to decide which local subdirs survive
+// the full-mirror cleanup.
+func buildSFTPDirSet(entries []sftpEntry) map[string]struct{} {
+	set := make(map[string]struct{})
+	for _, e := range entries {
+		if e.Info.IsDir() {
+			set[e.RelSlash] = struct{}{}
+		}
+	}
+	return set
+}
+
+// cleanupFullMirror deletes any immediate subdirectory of `<localRoot>/<mirrorRel>`
+// that is NOT present as a directory on SFTP at the same relative path. Files
+// directly inside `<localRoot>/<mirrorRel>` (mods.txt, mods.json, etc.) are
+// NEVER touched. Recursion stops at the immediate subdir level — once we
+// decide a subdir survives, its contents are not pruned (file-level updates
+// already happened during the download phase).
+func cleanupFullMirror(localRoot, mirrorRel string, sftpDirs map[string]struct{}) {
+	mirrorLocal := filepath.Join(localRoot, filepath.FromSlash(mirrorRel))
+	st, err := os.Stat(mirrorLocal)
+	if err != nil || !st.IsDir() {
+		return
+	}
+	entries, err := os.ReadDir(mirrorLocal)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		name := e.Name()
-		if !isManagedMod(name) {
-			continue // friend's other mods — leave alone
+		if !e.IsDir() {
+			continue // never delete files at this level
 		}
-		full := filepath.Join(localSubtree, name)
-		if _, present := onSFTP[name]; !present {
-			// Managed mod absent from SFTP → propagate delete.
-			os.RemoveAll(full)
-			continue
+		relSlash := mirrorRel + "/" + e.Name()
+		if _, ok := sftpDirs[relSlash]; ok {
+			continue // matching dir on SFTP — keep
 		}
-		// Managed mod present on SFTP → full-mirror inside the folder.
-		fullMirrorWithin(full, keep)
+		os.RemoveAll(filepath.Join(mirrorLocal, e.Name()))
 	}
-}
-
-// fullMirrorWithin walks `root` (absolute) and deletes any path not in `keep`.
-// Used inside a managed mod folder where everything is owned by WUR.
-func fullMirrorWithin(root string, keep map[string]struct{}) {
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		full := filepath.Join(root, e.Name())
-		abs, err := filepath.Abs(full)
-		if err != nil {
-			continue
-		}
-		clean := filepath.Clean(abs)
-		if _, ok := keep[clean]; !ok {
-			os.RemoveAll(full)
-			continue
-		}
-		if e.IsDir() {
-			fullMirrorWithin(full, keep)
-		}
-	}
-}
-
-// mergeModsTxt enforces the managed-list policy on friend's mods.txt.
-//
-//   - For every entry whose mod name is in `managedMods`:
-//   - present on SFTP → keep entry (with whatever flag user already has)
-//   - absent from SFTP → REMOVE entry (cleanup propagates)
-//   - For every entry whose mod name is NOT in `managedMods` → preserve verbatim.
-//   - For every managed mod on SFTP not yet listed → APPEND `<Name> : 1`.
-//
-// `additions` is the raw line list from `mods-additions.txt` and is treated as
-// a hint for the desired flag (`: 0` vs `: 1`) of new entries; if no hint,
-// default to `: 1`.
-func mergeModsTxt(additions []string, ue4ssOnSFTP map[string]struct{}) {
-	target := filepath.Join(localDir, filepath.FromSlash(modsTxtLocalSubpath))
-	existing, err := os.ReadFile(target)
-	if err != nil {
-		return // mods.txt not present — friend hasn't installed UE4SS yet
-	}
-
-	// Index hints from mods-additions.txt: managed mod name -> full line text.
-	hints := make(map[string]string)
-	for _, line := range additions {
-		if name := parseModName(line); name != "" && isManagedMod(name) {
-			hints[strings.ToLower(name)] = line
-		}
-	}
-
-	// Walk existing lines, drop managed mods missing from SFTP, keep everything else.
-	var out []string
-	have := make(map[string]struct{})
-	scanner := bufio.NewScanner(bytes.NewReader(existing))
-	for scanner.Scan() {
-		line := scanner.Text()
-		name := parseModName(line)
-		if name != "" && isManagedMod(name) {
-			if _, present := ue4ssOnSFTP[name]; !present {
-				continue // drop — managed mod removed from SFTP
-			}
-			have[strings.ToLower(name)] = struct{}{}
-		}
-		out = append(out, line)
-	}
-
-	// Append any managed mod present on SFTP but not yet in mods.txt.
-	var toAppend []string
-	for name := range ue4ssOnSFTP {
-		if !isManagedMod(name) {
-			continue
-		}
-		if _, ok := have[strings.ToLower(name)]; ok {
-			continue
-		}
-		if hint, hasHint := hints[strings.ToLower(name)]; hasHint {
-			toAppend = append(toAppend, hint)
-		} else {
-			toAppend = append(toAppend, name+" : 1")
-		}
-		have[strings.ToLower(name)] = struct{}{}
-	}
-
-	// Compose output. Insertion strategy: if a "; Built-in keybinds" sentinel
-	// comment exists, insert appendees before it (preserves Keybinds-last
-	// convention); else append at end.
-	body := strings.Join(out, "\r\n")
-	if !strings.HasSuffix(body, "\r\n") && len(body) > 0 {
-		body += "\r\n"
-	}
-	if len(toAppend) > 0 {
-		insertion := strings.Join(toAppend, "\r\n") + "\r\n"
-		sentinel := "; Built-in keybinds"
-		if idx := strings.Index(body, sentinel); idx >= 0 {
-			lineStart := strings.LastIndex(body[:idx], "\n")
-			if lineStart < 0 {
-				lineStart = 0
-			} else {
-				lineStart++
-			}
-			prefix := body[:lineStart]
-			if !strings.HasSuffix(prefix, "\r\n\r\n") && !strings.HasSuffix(prefix, "\n\n") && !strings.HasSuffix(prefix, "\r\n") {
-				prefix += "\r\n"
-			}
-			body = prefix + insertion + body[lineStart:]
-		} else {
-			body += insertion
-		}
-	}
-
-	if bytes.Equal([]byte(body), existing) {
-		return // nothing to do
-	}
-
-	tmp := target + ".tmp"
-	if err := os.WriteFile(tmp, []byte(body), 0644); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, target); err != nil {
-		os.Remove(tmp)
-	}
-}
-
-// parseModName extracts the mod name from a `<Name> : <0|1>` line.
-// Returns "" for blank lines, comments, or malformed entries.
-func parseModName(line string) string {
-	line = strings.TrimSpace(line)
-	if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") {
-		return ""
-	}
-	colon := strings.IndexByte(line, ':')
-	if colon < 0 {
-		return ""
-	}
-	name := strings.TrimSpace(line[:colon])
-	return name
 }
 
 func sanityCheck() error {
-	for _, st := range subtrees {
-		if st.LocalSubpath == "" || st.LocalSubpath == "." || filepath.IsAbs(st.LocalSubpath) || strings.Contains(st.LocalSubpath, "..") {
-			return fmt.Errorf("unsafe subtree LocalSubpath: %q", st.LocalSubpath)
+	for _, d := range fullMirrorDirs {
+		if d == "" || filepath.IsAbs(d) || strings.Contains(d, "..") {
+			return fmt.Errorf("unsafe fullMirrorDirs entry: %q", d)
 		}
-		if st.RemoteSubpath == "" || strings.Contains(st.RemoteSubpath, "..") {
-			return fmt.Errorf("unsafe subtree RemoteSubpath: %q", st.RemoteSubpath)
-		}
-	}
-	if len(managedMods) == 0 {
-		return fmt.Errorf("managedMods is empty — refusing to run")
 	}
 	if _, err := os.Stat(gameExecutable); err != nil {
 		return fmt.Errorf("%s не найден рядом с WUR.exe — запусти из корня папки Windrose", gameExecutable)
