@@ -17,7 +17,7 @@ a few times, then shows a notice and launches the game anyway (no update).
 cmd /c "curl -sSfL -z wur.exe -R -o wur.exe https://raw.githubusercontent.com/UberMorgott/mod-updaters/main/wur.exe && wur.exe %command%"
 ```
 
-Syncs `…/modpacks/Windrose/` on the Keenetic SFTP 1:1 into the Windrose install.
+Syncs `…/modpacks/Windrose/` on the SFTP server 1:1 into the Windrose install.
 Cleanup (delete orphan mods) restricted to immediate subdirs of:
 - `R5\Binaries\Win64\ue4ss\Mods`
 - `R5\Content\Paks\~mods\~mods`
@@ -38,14 +38,25 @@ Syncs `…/modpacks/Valheim/` 1:1 into the Valheim install. Cleanup restricted t
 
 - `engine/` — shared logic: SFTP connect+retry, walk/diff, resumable downloads
   (`.part` + `.meta` sidecar), mirror cleanup, TUI (progress + fail screen), launch.
-- `server.go` — shared SFTP credentials + `RemoteBase` (no build tag, compiled
-  into every exe). Change router login/password/IP here once.
+- `server.go` — wires the SFTP connection settings (server, login, password,
+  `RemoteBase`, pinned `HostKey`) into `engine.ServerConfig`. The values are
+  empty in source and **injected at build time** via `-ldflags -X` from a local,
+  gitignored `config.txt` — they never live in the repo, only in the built exe.
 - `game_<name>.go` — per-game `engine.Config` behind `//go:build <name>`
   (game subdir, executable, launch args, cleanup specs).
 - `main.go` — `engine.Run(gameConfig)`.
 
-The SFTP account is read-only and confined to `Share/modpacks` on the
-router, so the embedded credentials grant nothing beyond reading the mod files.
+The SFTP account is read-only and confined to its mod-pack directory, so the
+embedded credentials grant nothing beyond reading the mod files.
+
+## Configuration
+
+1. Copy `config.example.txt` → `config.txt` (gitignored) and fill in `server`,
+   `login`, `password`, `remote_base`, and `host_key`
+   (`ssh-keyscan -t ed25519 <host>` — used for SSH host-key pinning).
+2. `build.bat` reads `config.txt` and bakes the values into the exes. To build a
+   single game by hand you must pass the same `-X main.cfg*` ldflags, otherwise
+   the exe is built with empty connection settings.
 
 ## Adding a new game
 
