@@ -22,7 +22,7 @@ const (
 	sftpServer     = "morgott.keenetic.pro:22"
 	sftpLogin      = "modman"
 	sftpPassword   = "Br2ctG7FGSqPhr4"
-	remoteDir      = "/tmp/mnt/01DB6F2D5E1A6080/Valheim/"
+	remoteDir      = "/tmp/mnt/01DB6F2D5E1A6080/modpacks/Valheim/"
 	localDir       = "."
 	gameExecutable = "valheim.exe"
 	pluginsSubPath = "BepInEx/plugins"
