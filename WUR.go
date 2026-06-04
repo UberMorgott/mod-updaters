@@ -426,6 +426,14 @@ func (m *model) syncAndLaunch() tea.Cmd {
 	return func() tea.Msg {
 		defer m.closeConnections()
 
+		// Safety: if the remote listing is empty (remote dir missing or
+		// unreachable), do NOT run the mirror cleanup — that would wipe the
+		// friend's installed mods. Just launch the game as-is.
+		if len(m.allEntries) == 0 {
+			launchGame()
+			return nil
+		}
+
 		// Create directories that exist on SFTP (so empty dirs survive a sync).
 		for _, e := range m.allEntries {
 			if e.Info.IsDir() {
@@ -443,12 +451,15 @@ func (m *model) syncAndLaunch() tea.Cmd {
 			cleanupFullMirror(localRootAbs, mirror, sftpDirs)
 		}
 
-		// Запуск игры
-		cmd := exec.Command("cmd", "/C", "start", "/B", "/high", gameExecutable, "-console")
-		cmd.Dir = localDir
-		cmd.Start()
+		launchGame()
 		return nil
 	}
+}
+
+func launchGame() {
+	cmd := exec.Command("cmd", "/C", "start", "/B", "/high", gameExecutable, "-console")
+	cmd.Dir = localDir
+	cmd.Start()
 }
 
 // buildSFTPDirSet returns the set of forward-slash relative paths that are

@@ -384,6 +384,14 @@ func (m *model) syncAndLaunch() tea.Cmd {
 	return func() tea.Msg {
 		defer m.closeConnections()
 
+		// Защита: если удалённый листинг пуст (папка на сервере отсутствует
+		// или недоступна), НЕ запускаем чистку — иначе сотрём локальные моды.
+		// Просто запускаем игру с тем, что уже установлено.
+		if len(m.allEntries) == 0 {
+			launchGame()
+			return nil
+		}
+
 		// Создаём директории
 		for _, e := range m.allEntries {
 			if e.Info.IsDir() {
@@ -407,12 +415,15 @@ func (m *model) syncAndLaunch() tea.Cmd {
 		}
 		cleanDir(localPlugins, "", remoteSet)
 
-		// Запуск игры
-		cmd := exec.Command("cmd", "/C", "start", "/B", "/high", gameExecutable, "-console")
-		cmd.Dir = localDir
-		cmd.Start()
+		launchGame()
 		return nil
 	}
+}
+
+func launchGame() {
+	cmd := exec.Command("cmd", "/C", "start", "/B", "/high", gameExecutable, "-console")
+	cmd.Dir = localDir
+	cmd.Start()
 }
 
 func cleanDir(base, rel string, keep map[string]struct{}) {
