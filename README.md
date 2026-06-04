@@ -44,7 +44,7 @@ Syncs `…/modpacks/Valheim/` 1:1 into the Valheim install. Cleanup restricted t
   (game subdir, executable, launch args, cleanup specs).
 - `main.go` — `engine.Run(gameConfig)`.
 
-The SFTP account `modman` is read-only and confined to `Share/modpacks` on the
+The SFTP account is read-only and confined to `Share/modpacks` on the
 router, so the embedded credentials grant nothing beyond reading the mod files.
 
 ## Adding a new game

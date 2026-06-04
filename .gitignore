@@ -1,6 +1,10 @@
 # Build artefacts
 *.bak
+*.bak*
 *.tmp
+
+# Build-time secrets (server address + credentials) — NEVER commit
+config.txt
 
 # Editor local state
 .vscode/

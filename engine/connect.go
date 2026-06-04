@@ -52,19 +52,34 @@ type startConnectMsg struct{ attempt int }
 // connectFailedMsg — all attempts exhausted, server unreachable.
 type connectFailedMsg struct{ err error }
 
-// sshConfig builds the SSH client config for the given server.
-func sshConfig(s ServerConfig) *ssh.ClientConfig {
-	return &ssh.ClientConfig{
-		User:            s.Login,
-		Auth:            []ssh.AuthMethod{ssh.Password(s.Password)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
+// sshConfig builds the SSH client config for the given server, pinning the
+// server's host key from s.HostKey (a known_hosts-format line injected at build
+// time). Returns an error if the host key is missing or unparseable — we never
+// fall back to an insecure callback.
+func sshConfig(s ServerConfig) (*ssh.ClientConfig, error) {
+	if s.HostKey == "" {
+		return nil, fmt.Errorf("no pinned host key configured")
 	}
+	_, _, key, _, _, err := ssh.ParseKnownHosts([]byte(s.HostKey))
+	if err != nil {
+		return nil, fmt.Errorf("parse host key: %w", err)
+	}
+	return &ssh.ClientConfig{
+		User:              s.Login,
+		Auth:              []ssh.AuthMethod{ssh.Password(s.Password)},
+		HostKeyCallback:   ssh.FixedHostKey(key),
+		HostKeyAlgorithms: []string{key.Type()},
+		Timeout:           10 * time.Second,
+	}, nil
 }
 
 // dial opens an SSH + SFTP connection to the configured server.
 func dial(s ServerConfig) (*ssh.Client, *sftp.Client, error) {
-	sshClient, err := ssh.Dial("tcp", s.Host, sshConfig(s))
+	cfg, err := sshConfig(s)
+	if err != nil {
+		return nil, nil, fmt.Errorf("SSH: %w", err)
+	}
+	sshClient, err := ssh.Dial("tcp", s.Host, cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("SSH: %w", err)
 	}

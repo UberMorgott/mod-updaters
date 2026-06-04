@@ -4,6 +4,9 @@ package engine
 // RemoteBase must end with "/".
 type ServerConfig struct {
 	Host, Login, Password, RemoteBase string
+	// HostKey is a known_hosts-format line used to pin the server's SSH host
+	// key (ssh.ParseKnownHosts). Injected at build time; empty in source.
+	HostKey string
 }
 
 // SyncMode selects how a Cleanup path prunes orphans.

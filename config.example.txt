@@ -1,0 +1,11 @@
+# Build-time secrets injected into the exe via build.bat (-ldflags -X).
+# Copy this file to config.txt and fill in the real values.
+# config.txt is gitignored and MUST NEVER be committed.
+#
+# host_key is a known_hosts-format line, obtain it with:
+#   ssh-keyscan -t ed25519 <host>
+server=
+login=
+password=
+remote_base=
+host_key=

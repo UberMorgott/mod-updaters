@@ -14,7 +14,7 @@ toolchain/deps. Output exe names stay `uar.exe` / `wur.exe` at repo root
 
 - Output: `go build -tags <game> ... -o <exe>` must still produce `uar.exe`,
   `wur.exe` at repo root. Names must not change.
-- SFTP creds stay embedded (verified low-risk: `modman` is read-only, no shell,
+- SFTP creds stay embedded (verified low-risk: the account is read-only, no shell,
   now confined to `Share/modpacks`). No transport change.
 - Behaviour parity with current exes for the sync/cleanup of each game — must
   not over-delete. Verify before replacing deployed exes.
@@ -78,9 +78,12 @@ missing or `needsUpdate` (size or mtime differ). `Cleanup` only governs deletion
 Outside `Cleanup` paths nothing is ever deleted.
 
 ### Shared server (server.go, no tag)
+Host / Login / Password / RemoteBase / HostKey are injected at build time from the
+gitignored `config.txt` via `-ldflags -X` (see `build.bat`). They are empty in
+tracked source — no server address or credentials live in the public repo.
 ```
-Host="morgott.keenetic.pro:22", Login="modman", Password="Br2ctG7FGSqPhr4",
-RemoteBase="/tmp/mnt/01DB6F2D5E1A6080/modpacks/"
+Host="<injected>", Login="<injected>", Password="<injected>",
+RemoteBase="<injected>", HostKey="<injected>"
 ```
 
 ### game_valheim.go (//go:build valheim) → uar.exe
