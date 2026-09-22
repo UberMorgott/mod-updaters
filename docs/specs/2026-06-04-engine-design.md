@@ -22,7 +22,7 @@ toolchain/deps. Output exe names stay `uar.exe` / `wur.exe` at repo root
 
 ## Architecture
 
-```
+```text
 mod-updaters/
 ├─ engine/
 │  ├─ config.go    # Config, ServerConfig, CleanupSpec, SyncMode types
@@ -78,21 +78,25 @@ missing or `needsUpdate` (size or mtime differ). `Cleanup` only governs deletion
 Outside `Cleanup` paths nothing is ever deleted.
 
 ### Shared server (server.go, no tag)
+
 Host / Login / Password / RemoteBase / HostKey are injected at build time from the
 gitignored `config.txt` via `-ldflags -X` (see `build.bat`). They are empty in
 tracked source — no server address or credentials live in the public repo.
-```
+
+```text
 Host="<injected>", Login="<injected>", Password="<injected>",
 RemoteBase="<injected>", HostKey="<injected>"
 ```
 
 ### game_valheim.go (//go:build valheim) → uar.exe
+
 - GameName "Valheim", GameExecutable "valheim.exe", LaunchArgs ["-console"]
 - RemoteSubdir "Valheim/"
 - Cleanup: [{ "BepInEx/plugins", MirrorFiles }]
   (matches current UAR: 1:1 download, full mirror only inside BepInEx/plugins)
 
 ### game_windrose.go (//go:build windrose) → wur.exe
+
 - GameName "Windrose", GameExecutable "Windrose.exe", LaunchArgs ["-console"]
 - RemoteSubdir "Windrose/"
 - Cleanup (matches current WUR fullMirrorDirs, MirrorSubdirs semantics):

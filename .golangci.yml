@@ -1,0 +1,248 @@
+# golangci-lint v2 config. Drop it next to go.mod.
+#
+# govet runs here with `disable-all: true` plus an explicit allow-list: the gate
+# already runs `go vet ./...` as its own phase, so this section adds ONLY the
+# analyzers that are not part of cmd/vet's default suite. Nothing is checked twice.
+version: "2"
+
+run:
+  timeout: 3m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - staticcheck
+    - unused
+    - ineffassign
+    - errcheck
+    - errorlint
+    - forcetypeassert
+    - nilerr
+    - nolintlint
+    - bodyclose
+    - noctx
+    - contextcheck
+    - rowserrcheck
+    - sqlclosecheck
+    - gosec
+    - modernize
+    # Defect-finding linters -- cheap, low false-positive rate, keep green.
+    - govet
+    - gocritic
+    - nosprintfhostport
+    - exhaustive
+    - wastedassign
+    - musttag
+    - fatcontext
+    - durationcheck
+    - makezero
+    - nilnesserr
+    - asasalint
+    - bidichk
+    - reassign
+    - tparallel
+    # `shadow` is deliberately NOT enabled: a probe on a mid-size codebase found
+    # 178 hits, nearly all legitimate `err` scoping. It would drown the signal.
+  settings:
+    modernize:
+      # These rewrites are correctness/API risks, not cleanups. They are
+      # default-disabled upstream; pinning them here keeps them off across a
+      # golangci-lint upgrade instead of depending on that default.
+      disable:
+        - omitzero # changes the JSON wire format (zero fields disappear) -- an
+          # API migration for any HTTP client, not a cleanup.
+        - slicesclip # (upstream `appendclipped`) can turn a nil slice into a
+          # non-nil one, which changes JSON `null` into `[]`.
+      # Re-pin these here if a future version adds them: `slicesdelete`
+      # (different memory semantics, aliases observe different data) and
+      # `bloop` / `fmtappendf` (performance trade-offs, not correctness).
+    exhaustive:
+      # A switch with a real `default` that does actual work counts as
+      # exhaustive. Switches with NO default are still reported -- that is where
+      # the genuine gaps are. Never silence this with an empty default branch:
+      # a new enum member falling into the void is exactly the bug it catches.
+      default-signifies-exhaustive: true
+    govet:
+      disable-all: true
+      enable:
+        # Only analyzers absent from cmd/vet's default suite -- the `go vet ./...`
+        # gate phase already covers the rest.
+        - httpmux
+        - nilness
+        - reflectvaluecompare
+        - sortslice
+        - unusedwrite
+    gocritic:
+      # gocritic is mostly style; enable only the bug-finding checks.
+      disable-all: true
+      enabled-checks:
+        - appendAssign
+        - exitAfterDefer
+        - argOrder
+        - offBy1
+        - returnAfterHttpError
+        - truncateCmp
+        - weakCond
+    nolintlint:
+      # A bare `//nolint` fails the gate: a suppression needs a linter name and a
+      # reason. A directive that no longer suppresses anything is reported too,
+      # so dead ones get deleted instead of accumulating.
+      allow-unused: false
+      require-specific: true
+    gosec:
+      # G304 (file inclusion) and G107 (SSRF) stay ON -- both found real bugs.
+      # G115 (integer overflow conversion) is deliberately NOT excluded: it is a
+      # real bug class, not noise.
+      # The rules below carry no signal on Windows (POSIX permission bits are not
+      # how access is controlled there). Drop these exclusions on POSIX.
+      excludes:
+        - G104 # unhandled errors -- already covered by errcheck
+        - G301 # directory permissions 0750 -- N/A on Windows ACLs
+        - G302 # file permissions 0600 -- N/A on Windows ACLs
+        - G306 # WriteFile permissions -- N/A on Windows ACLs
+        # Taint analysis (G7xx) is OPT-IN: its output is nondeterministic. Measured
+        # with gosec v2.28.0 on an unchanged tree: three runs gave 6, 6, then 3
+        # G703 findings. golangci-lint caches one draw per file hash, so it looks
+        # stable until any edit re-rolls it. A `//nolint:gosec` on such a finding
+        # is then reported unused by nolintlint (allow-unused is global, it cannot
+        # be relaxed per linter), so the gate is red with the directive AND
+        # without it. To trial them, delete these lines and handle each finding
+        # with a fix or a path-scoped `exclusions.rules` entry, never `//nolint`.
+        - G701 # SQL injection
+        - G702 # command injection
+        - G703 # path traversal
+        - G704 # SSRF
+        - G705 # XSS
+        - G706 # log injection
+        - G707 # SMTP injection
+        - G708 # template injection
+        - G709 # unsafe deserialization
+        - G710 # open redirect
+  exclusions:
+    generated: strict
+    # Code that cannot be fixed (unfinished one-off tools, gitignored scratch
+    # dirs) belongs out of the linter's scope EXPLICITLY, with the reason next to
+    # it -- not silenced rule by rule. It stays in `go build ./...`.
+    paths:
+      # Third-party Go inside an npm tree. `flatted` (pulled in transitively by
+      # eslint) ships a Go implementation of itself, `golangci-lint run ./...`
+      # from the module root walks straight into it, and a go+web repo went red
+      # on code nobody here wrote and `npm i` rewrites at will. Not an edge case:
+      # a multi-stack repo is what this gate is for.
+      - 'node_modules/'
+      # Vendored dependencies are somebody else's code too, and re-vendoring
+      # would undo any fix.
+      - 'vendor/'
+      # - '^cmd/scratch/'
+    # `[]`, not a bare `rules:`: a key holding only comments is YAML null, and
+    # `golangci-lint config verify` rejects it (want array). Replace the `[]`
+    # when you add the first rule.
+    rules: []
+      # ---------------------------------------------------------------------
+      # ADOPTING THIS ON AN EXISTING CODEBASE
+      #
+      # A first run on an unlinted repo returns hundreds of findings. The usual
+      # reaction is to disable the noisy linters globally, and a globally
+      # disabled linter is never re-enabled.
+      #
+      # DEFAULT: a real baseline, not an exclusion list.
+      #   check.ps1 -Baseline <rev>   ->   golangci-lint run --new-from-rev <rev> --whole-files
+      # Everything older than <rev> is out of scope, everything new is strict --
+      # including a new defect in a package nobody has cleaned yet. Use
+      # HEAD~ or the merge base in CI; --whole-files judges a touched file as a
+      # whole rather than only the changed lines.
+      #
+      # FALLBACK: the cleanup queue below. Coarser and weaker -- a new violation
+      # inside a still-excluded package stays hidden -- so use it only for tools
+      # with no baseline mode, or when you want the backlog visible in the diff.
+      #
+      # Leave every linter enabled repo-wide and defer the noisy ones PER
+      # PACKAGE here. Pick the few that dominate the count (for us: errcheck,
+      # noctx, gosec, contextcheck, forcetypeassert) and list every package that
+      # is not clean yet:
+      #
+      #   - path: '^internal/foo/[^/]+\.go$'
+      #     linters: [errcheck, noctx, gosec, contextcheck, forcetypeassert]
+      #
+      # Rules:
+      #   * Anchor each regex to the package's OWN files (`^dir/[^/]+\.go$`),
+      #     never its subdirectories -- otherwise cleaning a parent silently
+      #     un-defers its children.
+      #   * A package not listed is strict, including any package added later.
+      #   * Clean one package, DELETE its line. That package is strict forever
+      #     after: a new violation there fails the gate, so it cannot regress.
+      #   * The list only shrinks. It IS the backlog and the progress bar --
+      #     a second tracker diverges from reality within a week.
+      #   * Keep a running comment here: starting count, what each package cost,
+      #     what is left, and WHY anything is still deferred.
+      #   * Order the queue by descending finding count, except a package with
+      #     zero test coverage: write characterisation tests for it first.
+      #
+      # A cleaned entry that no longer suppresses anything must not rot here.
+      # golangci-lint has no unused-exclusion report, so re-run without the
+      # exclusion after cleaning a package and delete the line the same commit.
+      # (ESLint does have one -- see the frontend note in README.)
+      #
+      # NOTE on gosec's taint rules (G7xx, off by default -- see gosec.excludes):
+      # the findings change from run to run on the same code, and the analysis is
+      # inter-package, so a per-package run hides findings. If you opt in, verify
+      # with `golangci-lint cache clean` + `golangci-lint run ./...` over the
+      # WHOLE repo, repeated until the number stops changing.
+      # ---------------------------------------------------------------------
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+# RECOMMENDED formatters, commented out on purpose: `golangci-lint run` reports
+# every unformatted file as an issue, so enabling them on a gofmt-only codebase
+# turns the gate red over whitespace. Adopt in one commit: uncomment, run
+# `golangci-lint fmt ./...` (both are autofix), commit the rewrite. gofumpt is a
+# strict superset of gofmt; gci groups imports std / third-party / this module.
+# Verified with golangci-lint v2.13.2 (`config verify` + `run`).
+# formatters:
+#   enable:
+#     - gofumpt
+#     - gci
+#   settings:
+#     gci:
+#       sections:
+#         - standard
+#         - default
+#         - localmodule
+#   exclusions:
+#     generated: strict
+#     paths:
+#       - 'node_modules/'
+#       - 'vendor/'
+
+# OPT-IN, not wired into the gate. Add to the full level (pre-commit / CI) once
+# you have run each one by hand and seen its output:
+#   govulncheck ./...   known CVEs in the dependency graph. Worth it; needs
+#                       network, so it belongs in CI or the full level only.
+#   NilAway (go.uber.org/nilaway)  nil-panic analysis. Worth it, but adopt it
+#                       per package -- a whole-repo first run is unusable.
+#   govet nilness       already enabled above under `govet.enable`.
+#   exhaustruct_v5      every struct literal must set every field. Repo-wide it
+#                       is noise (measured: 284 hits, 220 in tests); TARGETED
+#                       at determinism-critical state/snapshot types it is a
+#                       real guard. Full type name incl. package path; v5
+#                       rejects the old `include`/`exclude` keys (use
+#                       `enforce-patterns`/`ignore-patterns`, v2.13.2).
+#                       `explicit-mode: true` is REQUIRED: without it v5
+#                       checks every struct and enforce-patterns change
+#                       nothing (measured):
+#                         linters.enable: [exhaustruct_v5]
+#                         linters.settings.exhaustruct_v5.explicit-mode: true
+#                         linters.settings.exhaustruct_v5.enforce-patterns:
+#                           - '.*/internal/sim\.(State|Snapshot)$'
+#                       Plus, to skip test literals, an exclusions.rules entry:
+#                           - path: '_test\.go$'
+#                             linters: [exhaustruct_v5]
+#   gosec G7xx (taint)  excluded in gosec.excludes above. Real value, but its
+#                       findings are nondeterministic and cannot be kept
+#                       suppressed with `//nolint`; trial it by hand only.
+# NOT recommended: `govet shadow` -- measured 178 hits on a mid-size codebase,
+# nearly all legitimate `err` scoping. It drowns the signal.

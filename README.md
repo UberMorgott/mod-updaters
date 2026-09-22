@@ -13,12 +13,13 @@ a few times, then shows a notice and launches the game anyway (no update).
 
 ### Windrose
 
-```
+```bat
 cmd /c "curl -sSfL -z wur.exe -R -o wur.exe https://raw.githubusercontent.com/UberMorgott/mod-updaters/main/wur.exe && wur.exe %command%"
 ```
 
 Syncs `…/modpacks/Windrose/` on the SFTP server 1:1 into the Windrose install.
 Cleanup (delete orphan mods) restricted to immediate subdirs of:
+
 - `R5\Binaries\Win64\ue4ss\Mods`
 - `R5\Content\Paks\~mods\~mods`
 
@@ -27,7 +28,7 @@ Everything else is additive (never deleted) — game binaries, `dwmapi.dll`,
 
 ### Valheim
 
-```
+```bat
 cmd /c "curl -sSfL -z uar.exe -R -o uar.exe https://raw.githubusercontent.com/UberMorgott/mod-updaters/main/uar.exe && uar.exe %command%"
 ```
 
@@ -71,4 +72,4 @@ embedded credentials grant nothing beyond reading the mod files.
 - `build.bat [valheim|windrose|all]` — build (`-ldflags "-s -w"`) + UPX-compress
   (`Z:\SOFT\СЖАТИЕ EXE\upx.exe`, falls back to `upx` on PATH, else uncompressed).
 - Build a single game manually: `go build -tags valheim -ldflags "-s -w" -o uar.exe .`
-- Go 1.26+ required.
+- Go 1.27+ required.
