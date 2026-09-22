@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,8 +16,8 @@ import (
 )
 
 const (
-	downloadBufSize     = 128 * 1024     // 128 KiB copy buffer
-	maxDownloadRetries  = 3              // reconnect+resume attempts on transient mid-file error
+	downloadBufSize     = 128 * 1024 // 128 KiB copy buffer
+	maxDownloadRetries  = 3          // reconnect+resume attempts on transient mid-file error
 	downloadRetryBackof = 2 * time.Second
 )
 
@@ -96,8 +97,8 @@ func downloadFile(cfg Config, client *sftp.Client, file sftpEntry, ch chan<- uin
 	}
 	if startOffset == 0 {
 		// Fresh start: drop any stale part/meta and write a fresh meta.
-		os.Remove(partPath)
-		os.Remove(metaPath(partPath))
+		_ = os.Remove(partPath)           // may not exist
+		_ = os.Remove(metaPath(partPath)) // may not exist
 		if err := writeMeta(partPath, file.Info); err != nil {
 			return err
 		}
@@ -113,24 +114,24 @@ func downloadFile(cfg Config, client *sftp.Client, file sftpEntry, ch chan<- uin
 	var retrySFTP *sftp.Client
 	defer func() {
 		if retrySFTP != nil {
-			retrySFTP.Close()
+			_ = retrySFTP.Close()
 		}
 		if retrySSH != nil {
-			retrySSH.Close()
+			_ = retrySSH.Close()
 		}
 	}()
 
 	var lastErr error
-	for attempt := 0; attempt < maxDownloadRetries; attempt++ {
+	for attempt := range maxDownloadRetries {
 		if attempt > 0 {
 			// Reconnect and re-resume from however much is on disk now.
 			time.Sleep(downloadRetryBackof)
 			if retrySFTP != nil {
-				retrySFTP.Close()
+				_ = retrySFTP.Close()
 				retrySFTP = nil
 			}
 			if retrySSH != nil {
-				retrySSH.Close()
+				_ = retrySSH.Close()
 				retrySSH = nil
 			}
 			newSSH, newSFTP, derr := dial(cfg.Server)
@@ -175,12 +176,15 @@ func downloadFile(cfg Config, client *sftp.Client, file sftpEntry, ch chan<- uin
 	}
 
 	// Complete: finalize.
-	os.Remove(localPath) // ensure rename can overwrite on Windows
+	_ = os.Remove(localPath) // ensure rename can overwrite on Windows; may not exist
 	if err := os.Rename(partPath, localPath); err != nil {
 		return fmt.Errorf("rename %s: %w", filepath.Base(localPath), err)
 	}
-	os.Chtimes(localPath, time.Now(), file.Info.ModTime())
-	os.Remove(metaPath(partPath))
+	_ = os.Remove(metaPath(partPath)) // best-effort: orphan meta is ignored without its .part
+	// mtime must match remote, otherwise needsUpdate re-downloads next run.
+	if err := os.Chtimes(localPath, time.Now(), file.Info.ModTime()); err != nil {
+		return fmt.Errorf("chtimes %s: %w", filepath.Base(localPath), err)
+	}
 	return nil
 }
 
@@ -192,7 +196,7 @@ func copyFromOffset(client *sftp.Client, file sftpEntry, partPath string, offset
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 
 	if offset > 0 {
 		if _, err := src.Seek(offset, io.SeekStart); err != nil {
@@ -207,7 +211,7 @@ func copyFromOffset(client *sftp.Client, file sftpEntry, partPath string, offset
 	} else {
 		flag |= os.O_TRUNC
 	}
-	dst, err := os.OpenFile(partPath, flag, 0644)
+	dst, err := os.OpenFile(partPath, flag, 0644) //nolint:gosec // G304: partPath is derived from the local game root, not external input
 	if err != nil {
 		return err
 	}
@@ -217,16 +221,16 @@ func copyFromOffset(client *sftp.Client, file sftpEntry, partPath string, offset
 		n, rErr := src.Read(buf)
 		if n > 0 {
 			if _, wErr := dst.Write(buf[:n]); wErr != nil {
-				dst.Close()
+				_ = dst.Close()
 				return wErr
 			}
 			ch <- uint64(n)
 		}
-		if rErr == io.EOF {
+		if errors.Is(rErr, io.EOF) {
 			break
 		}
 		if rErr != nil {
-			dst.Close()
+			_ = dst.Close()
 			return rErr
 		}
 	}

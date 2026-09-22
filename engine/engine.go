@@ -154,7 +154,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.status = fmt.Sprintf("Найдено %d файлов (%.2f MB)", len(m.files), float64(m.totalSize)/1024/1024)
 		if len(m.files) > 0 {
-			m.currentFileSize = uint64(m.files[0].Info.Size())
+			m.currentFileSize = fileSize(m.files[0].Info)
 		}
 		return m, tea.Batch(m.downloadNext(), tickCmd())
 
@@ -187,7 +187,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Sequence(m.syncAndLaunch(), tea.Quit)
 		}
 		m.currentFileDown = 0
-		m.currentFileSize = uint64(m.files[m.currentIdx].Info.Size())
+		m.currentFileSize = fileSize(m.files[m.currentIdx].Info)
 		m.updateBarWidths()
 		return m, m.downloadNext()
 	}
@@ -206,10 +206,10 @@ func (m model) View() string {
 
 func (m *model) closeConnections() {
 	if m.sftp != nil {
-		m.sftp.Close()
+		_ = m.sftp.Close()
 	}
 	if m.sshClient != nil {
-		m.sshClient.Close()
+		_ = m.sshClient.Close()
 	}
 }
 

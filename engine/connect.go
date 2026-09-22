@@ -54,7 +54,7 @@ type connectFailedMsg struct{ err error }
 
 // sshConfig builds the SSH client config for the given server, pinning the
 // server's host key from s.HostKey (a known_hosts-format line injected at build
-// time). Returns an error if the host key is missing or unparseable — we never
+// time). Returns an error if the host key is missing or unparsable — we never
 // fall back to an insecure callback.
 func sshConfig(s ServerConfig) (*ssh.ClientConfig, error) {
 	if s.HostKey == "" {
@@ -85,7 +85,7 @@ func dial(s ServerConfig) (*ssh.Client, *sftp.Client, error) {
 	}
 	sftpClient, err := sftp.NewClient(sshClient)
 	if err != nil {
-		sshClient.Close()
+		_ = sshClient.Close()
 		return nil, nil, fmt.Errorf("SFTP: %w", err)
 	}
 	return sshClient, sftpClient, nil
@@ -137,7 +137,7 @@ func doConnect(cfg Config) (filesListedMsg, error) {
 		local, lerr := os.Stat(localPath)
 		if os.IsNotExist(lerr) || (lerr == nil && needsUpdate(local, info)) {
 			toDownload = append(toDownload, entry)
-			totalSize += uint64(info.Size())
+			totalSize += fileSize(info)
 		}
 	}
 
@@ -148,6 +148,15 @@ func doConnect(cfg Config) (filesListedMsg, error) {
 		allEntries: all,
 		totalSize:  totalSize,
 	}, nil
+}
+
+// fileSize returns info.Size() as uint64, clamping a (never expected) negative
+// size to 0.
+func fileSize(info os.FileInfo) uint64 {
+	if s := info.Size(); s > 0 {
+		return uint64(s)
+	}
+	return 0
 }
 
 // needsUpdate reports whether the local file differs from remote by size or mtime.

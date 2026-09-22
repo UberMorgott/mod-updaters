@@ -28,7 +28,7 @@ func (m *model) syncAndLaunch() tea.Cmd {
 		// Create directories that exist on SFTP (so empty dirs survive a sync).
 		for _, e := range allEntries {
 			if e.Info.IsDir() {
-				os.MkdirAll(e.LocalPath, 0755)
+				_ = os.MkdirAll(e.LocalPath, 0755) // best-effort: a missing empty dir must not block launch
 			}
 		}
 
@@ -93,7 +93,7 @@ func cleanDir(base, rel string, keep map[string]struct{}) {
 	for _, e := range entries {
 		path := filepath.ToSlash(filepath.Join(rel, e.Name()))
 		if _, ok := keep[path]; !ok {
-			os.RemoveAll(filepath.Join(base, rel, e.Name()))
+			_ = os.RemoveAll(filepath.Join(base, rel, e.Name())) // best-effort cleanup
 		} else if e.IsDir() {
 			cleanDir(base, path, keep)
 		}
@@ -122,6 +122,6 @@ func mirrorSubdirs(localRoot, cleanupRel string, sftpDirs map[string]struct{}) {
 		if _, ok := sftpDirs[relSlash]; ok {
 			continue // matching dir on SFTP — keep
 		}
-		os.RemoveAll(filepath.Join(mirrorLocal, e.Name()))
+		_ = os.RemoveAll(filepath.Join(mirrorLocal, e.Name())) // best-effort cleanup
 	}
 }

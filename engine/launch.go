@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,9 +12,11 @@ import (
 // launchGame starts the game executable with /high priority, detached.
 func launchGame(cfg Config) {
 	args := append([]string{"/C", "start", "/B", "/high", cfg.GameExecutable}, cfg.LaunchArgs...)
-	cmd := exec.Command("cmd", args...)
+	cmd := exec.CommandContext(context.Background(), "cmd", args...) //nolint:gosec // G204: executable/args come from the build-time game config, not user input
 	cmd.Dir = "."
-	cmd.Start()
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintln(os.Stderr, "Ошибка запуска игры:", err)
+	}
 }
 
 // SanityCheck validates the config before running: the game executable must
