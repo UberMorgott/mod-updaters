@@ -7,6 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/pkg/sftp v1.13.11
+	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.57.0
 )
 

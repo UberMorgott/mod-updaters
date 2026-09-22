@@ -88,33 +88,47 @@ func (m model) progressView() string {
 	return appStyle.Render(strings.Join(lines, "\n"))
 }
 
-// failView — full-screen red notice: the update failed.
-func (m model) failView() string {
+// menuView — full-screen red notice after automatic retries are exhausted (or
+// the listing was partial): the reason plus the launch / retry / exit keys.
+func (m model) menuView() string {
+	title, body := "⚠   ОБНОВЛЕНИЕ НЕ УДАЛОСЬ   ⚠", "Моды могут быть устаревшими."
+	if m.syncDone {
+		title, body = "⚠   ОБНОВЛЕНИЕ НЕПОЛНОЕ   ⚠", "Загруженные моды установлены."
+	}
 	banner := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("231")).
 		Background(errorColor).
 		Bold(true).
 		Padding(1, 6).
-		Render("⚠   ОБНОВЛЕНИЕ НЕ УДАЛОСЬ   ⚠")
+		Render(title)
 
 	subtitle := lipgloss.NewStyle().
 		Foreground(errorColor).
 		Bold(true).
 		Align(lipgloss.Center).
-		Render("Сервер обновлений не отвечает")
+		Render(m.menuReason)
 
-	body := lipgloss.NewStyle().
+	bodyText := lipgloss.NewStyle().
 		Foreground(textColor).
 		Align(lipgloss.Center).
-		Render("Игра будет запущена\nБЕЗ обновления модов.")
+		Render(body)
 
-	hint := lipgloss.NewStyle().
+	detail := m.menuDetail
+	if r := []rune(detail); len(r) > max(m.width-20, 20) {
+		detail = string(r[:max(m.width-23, 17)]) + "..."
+	}
+	detailText := lipgloss.NewStyle().
 		Foreground(statsColor).
 		Italic(true).
-		Render("запуск через несколько секунд…")
+		Render(detail)
+
+	keys := lipgloss.NewStyle().
+		Foreground(titleColor).
+		Bold(true).
+		Render("[Enter] Запустить игру   [R] Повторить   [Esc] Выход")
 
 	content := lipgloss.JoinVertical(lipgloss.Center,
-		banner, "", subtitle, "", body, "", hint,
+		banner, "", subtitle, "", bodyText, "", detailText, "", keys,
 	)
 
 	box := lipgloss.NewStyle().

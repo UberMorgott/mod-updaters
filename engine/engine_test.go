@@ -1,13 +1,26 @@
 package engine
 
 import (
+	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/pkg/sftp"
+	"go.uber.org/goleak"
 )
+
+// TestMain fails the package if any test leaves a goroutine running.
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 // fakeInfo is a minimal os.FileInfo for remote entries.
 type fakeInfo struct {
@@ -272,5 +285,160 @@ func TestFinalize(t *testing.T) {
 	}
 	if exists(dir, "a.dll.part") || exists(dir, "a.dll.part.meta") {
 		t.Fatal(".part/.meta left behind")
+	}
+}
+
+func TestFinalizeFailureKeepsOldFile(t *testing.T) {
+	dir := t.TempDir()
+	local := filepath.Join(dir, "a.dll")
+	mkTree(t, dir, "a.dll", "a.dll.part.meta") // .part missing: chtimes fails first
+	if err := finalize(local+".part", local, time.Unix(1_700_000_000, 0)); err == nil {
+		t.Fatal("finalize without .part succeeded")
+	}
+	if !exists(dir, "a.dll") || !exists(dir, "a.dll.part.meta") {
+		t.Fatal("failed finalize touched the old file or the meta")
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	s := time.Second
+	want := []time.Duration{2 * s, 4 * s, 8 * s, 16 * s, 30 * s, 30 * s, 30 * s}
+	for i, w := range want {
+		if got := retryDelay(i + 1); got != w {
+			t.Errorf("retryDelay(%d) = %v, want %v", i+1, got, w)
+		}
+	}
+}
+
+func TestRetryBudget(t *testing.T) {
+	b := retryBudget{lastSize: 10}
+	for i := range maxDownloadRetries {
+		if _, ok := b.next(10); !ok {
+			t.Fatalf("budget exhausted after %d failures, want %d", i, maxDownloadRetries)
+		}
+	}
+	if _, ok := b.next(10); ok {
+		t.Fatal("budget not exhausted without progress")
+	}
+	// Progress refills the budget and restarts the backoff.
+	if d, ok := b.next(11); !ok || d != retryBaseDelay {
+		t.Fatalf("after progress: next = %v, %v; want %v, true", d, ok, retryBaseDelay)
+	}
+}
+
+func TestErrorClasses(t *testing.T) {
+	noFile := &sftp.StatusError{Code: uint32(sftp.ErrSSHFxNoSuchFile)}
+	failure := &sftp.StatusError{Code: 4} // SSH_FX_FAILURE
+	cases := []struct {
+		name            string
+		err             error
+		permanent, conn bool
+	}{
+		{"not exist", fmt.Errorf("open: %w", fs.ErrNotExist), true, false},
+		{"permission", &fs.PathError{Op: "open", Err: fs.ErrPermission}, true, false},
+		{"sftp no such file", noFile, true, false},
+		{"sftp failure", failure, false, false},
+		{"eof", io.EOF, false, true},
+		{"timeout", os.ErrDeadlineExceeded, false, true},
+	}
+	for _, c := range cases {
+		if got := isPermanent(c.err); got != c.permanent {
+			t.Errorf("%s: isPermanent = %v, want %v", c.name, got, c.permanent)
+		}
+		if got := isConnError(c.err); got != c.conn {
+			t.Errorf("%s: isConnError = %v, want %v", c.name, got, c.conn)
+		}
+	}
+}
+
+func TestReconcilePart(t *testing.T) {
+	dir := t.TempDir()
+	part := filepath.Join(dir, "a.dll.part")
+	info := fakeInfo{size: 100, mtime: time.Unix(1_700_000_000, 0)}
+	if err := writeMeta(part, info); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(part, make([]byte, 40), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := reconcilePart(part, info); err != nil || partOffset(part, 100) != 40 {
+		t.Fatalf("unchanged remote: err=%v offset=%d, want resume at 40", err, partOffset(part, 100))
+	}
+	changed := fakeInfo{size: 200, mtime: info.mtime.Add(time.Hour)}
+	if err := reconcilePart(part, changed); err != nil {
+		t.Fatal(err)
+	}
+	if exists(dir, "a.dll.part") || !metaMatches(part, changed) {
+		t.Fatal("changed remote: .part kept or meta not rewritten")
+	}
+}
+
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+func TestCopyProgressWriteError(t *testing.T) {
+	ch := make(chan uint64, 10)
+	if err := copyProgress(failWriter{}, strings.NewReader("data"), ch); err == nil {
+		t.Fatal("write error swallowed")
+	}
+}
+
+func key(s string) tea.KeyMsg {
+	switch s {
+	case "enter":
+		return tea.KeyMsg{Type: tea.KeyEnter}
+	case "esc":
+		return tea.KeyMsg{Type: tea.KeyEsc}
+	}
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+}
+
+// update feeds msg to m and returns the resulting model.
+func update(t *testing.T, m model, msg tea.Msg) (model, tea.Cmd) {
+	t.Helper()
+	got, cmd := m.Update(msg)
+	next, ok := got.(model)
+	if !ok {
+		t.Fatalf("Update returned %T, want model", got)
+	}
+	return next, cmd
+}
+
+func TestMenuKeys(t *testing.T) {
+	fm, _ := update(t, newModel(Config{}), errorMsg{io.EOF})
+	if !fm.menu || fm.menuReason == "" {
+		t.Fatal("errorMsg did not open the menu")
+	}
+
+	m, cmd := update(t, fm, key("x"))
+	if !m.menu || m.quitting || cmd != nil {
+		t.Fatal("unknown key changed the menu")
+	}
+
+	m, cmd = update(t, fm, key("esc"))
+	if !m.quitting || cmd == nil {
+		t.Fatal("Esc did not quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("Esc did not return tea.Quit")
+	}
+
+	for _, k := range []string{"r", "к"} {
+		m, cmd = update(t, fm, key(k))
+		if m.menu || m.quitting || cmd == nil {
+			t.Fatalf("%q did not restart the sync", k)
+		}
+	}
+
+	m, cmd = update(t, fm, key("enter")) // cmd launches the game: not executed here
+	if !m.quitting || cmd == nil {
+		t.Fatal("Enter did not launch")
+	}
+}
+
+func TestPartialListingShowsMenu(t *testing.T) {
+	if m, _ := update(t, newModel(Config{}), filesListedMsg{walkErr: fs.ErrPermission}); !m.menu || !m.syncDone {
+		t.Fatal("partial listing launched silently")
 	}
 }

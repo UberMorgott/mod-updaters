@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,10 +16,80 @@ import (
 )
 
 const (
-	maxConnectAttempts = 3               // how many times we try to reach the server
-	retryDelay         = 3 * time.Second // pause between attempts
-	failNoticeDelay    = 5 * time.Second // how long the fail screen is shown before launching
+	maxConnectAttempts = 3                // how many times we try to reach the server
+	dialTimeout        = 10 * time.Second // TCP connect
+	handshakeTimeout   = 20 * time.Second // SSH handshake + SFTP session start
+	ioTimeout          = 30 * time.Second // no traffic for this long = dead link
+	keepaliveInterval  = 15 * time.Second // SSH keepalive period (keeps idle links under ioTimeout)
+	retryBaseDelay     = 2 * time.Second  // first retry pause, doubled per failure
+	retryMaxDelay      = 30 * time.Second // cap for the doubled pause
 )
+
+// retryDelay returns the backoff before retry number n (1-based):
+// 2s, 4s, 8s, … capped at retryMaxDelay.
+func retryDelay(n int) time.Duration {
+	d := retryBaseDelay
+	for i := 1; i < n && d < retryMaxDelay; i++ {
+		d *= 2
+	}
+	return min(d, retryMaxDelay)
+}
+
+// isPermanent reports errors that a reconnect cannot fix (missing file,
+// permission denied — remote or local): they fail at once instead of retrying.
+func isPermanent(err error) bool {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+		return true
+	}
+	var se *sftp.StatusError
+	return errors.As(err, &se) &&
+		(se.FxCode() == sftp.ErrSSHFxNoSuchFile || se.FxCode() == sftp.ErrSSHFxPermissionDenied)
+}
+
+// isConnError reports whether an error during the walk means the connection
+// itself failed (anything that is not an SFTP status reply about one entry).
+func isConnError(err error) bool {
+	var se *sftp.StatusError
+	return !errors.As(err, &se) && !isPermanent(err)
+}
+
+// deadlineConn refreshes an inactivity deadline before every Read/Write, so a
+// stalled link errors out (into the retry path) instead of hanging forever.
+type deadlineConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c *deadlineConn) Read(p []byte) (int, error) {
+	if err := c.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *deadlineConn) Write(p []byte) (int, error) {
+	if err := c.SetWriteDeadline(time.Now().Add(c.timeout)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(p)
+}
+
+// keepalive pings the server every keepaliveInterval. A failed or unanswered
+// ping closes the client, which fails any in-flight SFTP call. It exits once
+// the client is closed (the next ping errors).
+func keepalive(client *ssh.Client) {
+	t := time.NewTicker(keepaliveInterval)
+	defer t.Stop()
+	for range t.C {
+		timer := time.AfterFunc(ioTimeout, func() { _ = client.Close() })
+		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+		timer.Stop()
+		if err != nil {
+			_ = client.Close()
+			return
+		}
+	}
+}
 
 // sftpEntry is one walked SFTP entry mapped 1:1 to a local path.
 type sftpEntry struct {
@@ -33,13 +105,15 @@ type conn struct {
 	sftp *sftp.Client
 }
 
-// Close closes the SFTP session and the SSH connection. Safe on a nil conn.
+// Close closes the SSH connection (TCP) first, so the SFTP close after it can
+// never block on a dead link. May still take a moment: callers in the TUI run
+// it off the Update loop (closeCmd). Safe on a nil conn.
 func (c *conn) Close() {
 	if c == nil {
 		return
 	}
-	_ = c.sftp.Close() // best-effort: the SSH close below tears the session down anyway
-	_ = c.ssh.Close()
+	_ = c.ssh.Close()  // best-effort: may already be closed by keepalive
+	_ = c.sftp.Close() // best-effort: the session died with the SSH connection
 }
 
 // --- bubbletea messages ---
@@ -51,9 +125,13 @@ type filesListedMsg struct {
 	files      []sftpEntry // files needing download
 	allEntries []sftpEntry // every SFTP entry seen (files + dirs) — used for cleanup keep-set
 	totalSize  uint64
-	// complete is false when the walk hit an error or rejected an unsafe entry:
-	// the keep-set may then be missing files, so cleanup must not run.
+	// complete is false when the walk hit an error or skipped an entry (unsafe
+	// name, dir symlink, special file): the keep-set may then be missing files,
+	// so cleanup must not run.
 	complete bool
+	// walkErr is the first per-entry walk error (not a skipped entry): the user
+	// is warned via the menu instead of a silent "success".
+	walkErr error
 }
 
 type progressTickMsg struct{}
@@ -92,25 +170,45 @@ func sshConfig(s ServerConfig) (*ssh.ClientConfig, error) {
 		Auth:              []ssh.AuthMethod{ssh.Password(s.Password)},
 		HostKeyCallback:   ssh.FixedHostKey(key),
 		HostKeyAlgorithms: []string{key.Type()},
-		Timeout:           10 * time.Second,
 	}, nil
 }
 
-// dial opens an SSH + SFTP connection to the configured server.
+// dial opens an SSH + SFTP connection to the configured server. Every stage is
+// bounded: TCP connect by dialTimeout, handshake + SFTP start by
+// handshakeTimeout, and afterwards any ioTimeout without traffic (keepalive
+// keeps a healthy idle link busy) kills the connection.
 func dial(s ServerConfig) (*conn, error) {
 	cfg, err := sshConfig(s)
 	if err != nil {
 		return nil, fmt.Errorf("SSH: %w", err)
 	}
-	sshClient, err := ssh.Dial("tcp", s.Host, cfg)
+	d := net.Dialer{Timeout: dialTimeout}
+	raw, err := d.DialContext(context.Background(), "tcp", s.Host)
 	if err != nil {
 		return nil, fmt.Errorf("SSH: %w", err)
 	}
+	nc := &deadlineConn{Conn: raw, timeout: ioTimeout}
+	// The per-Read deadline alone would let a trickling handshake run forever.
+	timer := time.AfterFunc(handshakeTimeout, func() { _ = raw.Close() })
+	defer timer.Stop()
+
+	sc, chans, reqs, err := ssh.NewClientConn(nc, s.Host, cfg)
+	if err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("SSH: %w", err)
+	}
+	sshClient := ssh.NewClient(sc, chans, reqs)
 	sftpClient, err := sftp.NewClient(sshClient)
 	if err != nil {
 		_ = sshClient.Close()
 		return nil, fmt.Errorf("SFTP: %w", err)
 	}
+	if !timer.Stop() {
+		// The handshake timer fired just as setup finished: the link is closed.
+		_ = sshClient.Close()
+		return nil, errors.New("SSH: handshake timeout")
+	}
+	go keepalive(sshClient)
 	return &conn{ssh: sshClient, sftp: sftpClient}, nil
 }
 
@@ -153,13 +251,29 @@ func doConnect(cfg Config) (filesListedMsg, error) {
 	var all, toDownload []sftpEntry
 	var totalSize uint64
 	complete := true
+	var walkErr error
+
+	// walkFailed handles a per-entry walk error. A dead connection aborts the
+	// attempt (it is retried like a failed connect); anything else leaves a
+	// partial listing: download what we can, but no cleanup and warn the user.
+	walkFailed := func(err error) error {
+		if isConnError(err) {
+			c.Close()
+			return fmt.Errorf("SFTP walk: %w", err)
+		}
+		complete = false
+		if walkErr == nil {
+			walkErr = err
+		}
+		return nil
+	}
 
 	walker := c.sftp.Walk(root)
 	for walker.Step() {
-		if walker.Err() != nil {
-			// Unreadable entry/dir: keep going (download what we can) but the
-			// listing is partial, so cleanup is disabled for this run.
-			complete = false
+		if err := walker.Err(); err != nil {
+			if ferr := walkFailed(err); ferr != nil {
+				return filesListedMsg{}, ferr
+			}
 			continue
 		}
 		rPath := walker.Path()
@@ -175,6 +289,25 @@ func doConnect(cfg Config) (filesListedMsg, error) {
 			if info.IsDir() {
 				walker.SkipDir()
 			}
+			continue
+		}
+
+		// The walk uses Lstat. A symlink to a file is followed (Stat) and synced
+		// as that file: Open follows it too, so sizes agree. A dir symlink or a
+		// special file can't be synced 1:1 (the walk doesn't descend into it,
+		// its Lstat size never matches the download) — skip it, no cleanup.
+		if info.Mode()&fs.ModeSymlink != 0 {
+			target, serr := c.sftp.Stat(rPath)
+			if serr != nil {
+				if ferr := walkFailed(serr); ferr != nil {
+					return filesListedMsg{}, ferr
+				}
+				continue
+			}
+			info = target
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			complete = false
 			continue
 		}
 
@@ -203,6 +336,7 @@ func doConnect(cfg Config) (filesListedMsg, error) {
 		allEntries: all,
 		totalSize:  totalSize,
 		complete:   complete,
+		walkErr:    walkErr,
 	}, nil
 }
 

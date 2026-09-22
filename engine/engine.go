@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
+	"net"
 	"os"
 	"time"
 
@@ -24,9 +27,17 @@ type model struct {
 	width, height                    int
 	err                              error
 	quitting                         bool
-	failed                           bool // server unreachable → show the fail screen
-	listingComplete                  bool // walk finished without errors → cleanup allowed
+	listingComplete                  bool  // walk finished without errors → cleanup allowed
+	walkErr                          error // listing partly failed → warn instead of silent success
 	startTime                        time.Time
+
+	// The menu replaces the progress screen once automatic retries are
+	// exhausted (or the listing was partial): the player picks launch / retry /
+	// exit — the updater never stands between the player and the game.
+	menu       bool
+	menuReason string // short Russian reason
+	menuDetail string // raw error text, for bug reports
+	syncDone   bool   // all downloads finished: launching may create dirs (cleanup still honors listingComplete)
 }
 
 func newModel(cfg Config) model {
@@ -92,12 +103,82 @@ func launchGameCmd(cfg Config) tea.Cmd {
 	}
 }
 
-// delayCmd just waits d (so the user can read the message).
-func delayCmd(d time.Duration) tea.Cmd {
-	return func() tea.Msg {
-		time.Sleep(d)
+// closeCmd closes c off the Update loop: a close on a dead link must never
+// freeze the UI.
+func closeCmd(c *conn) tea.Cmd {
+	if c == nil {
 		return nil
 	}
+	return func() tea.Msg {
+		c.Close()
+		return nil
+	}
+}
+
+// failReason maps an error to a short Russian reason for the menu.
+func failReason(err error) string {
+	var ne net.Error
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return "Нет доступа к файлу (игра запущена?)"
+	case errors.Is(err, fs.ErrNotExist):
+		return "Файл пропал с сервера во время загрузки"
+	case errors.As(err, &ne):
+		return "Соединение с сервером потеряно"
+	default:
+		return "Загрузка модов прервана"
+	}
+}
+
+// showMenu switches to the launch/retry/exit menu and drops the connection.
+func (m *model) showMenu(reason string, err error) tea.Cmd {
+	m.menu = true
+	m.menuReason = reason
+	m.menuDetail = ""
+	if err != nil {
+		m.menuDetail = err.Error()
+	}
+	c := m.conn
+	m.conn = nil
+	return closeCmd(c)
+}
+
+// finishSync runs after the last download (or when nothing needed one): launch
+// on a clean listing, otherwise warn via the menu instead of claiming success.
+func (m *model) finishSync(status string) tea.Cmd {
+	m.syncDone = true
+	if m.walkErr != nil {
+		return m.showMenu("Список модов получен не полностью — очистка пропущена", m.walkErr)
+	}
+	m.status = status
+	return tea.Sequence(m.syncAndLaunch(), tea.Quit)
+}
+
+// menuKey handles a key press while the menu is shown.
+func (m model) menuKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		m.quitting = true
+		if m.syncDone {
+			// Everything is downloaded: dirs may be created; cleanup still
+			// skipped because the listing was incomplete.
+			return m, tea.Sequence(m.syncAndLaunch(), tea.Quit)
+		}
+		// Partial sync: launch as-is, never run cleanup.
+		return m, tea.Sequence(launchGameCmd(m.cfg), tea.Quit)
+	case "r", "R", "к", "К": // "к" = R on the Russian layout
+		// Reconnect and continue: finished files are up to date now and are
+		// skipped by the new listing, unfinished ones resume from their .part.
+		n := newModel(m.cfg)
+		n.width, n.height = m.width, m.height
+		n.updateBarWidths()
+		n.status = "Повторное подключение..."
+		return n, connectCmd(n.cfg, 1)
+	case "esc", "ctrl+c", "q":
+		m.quitting = true
+		return m, tea.Quit
+	}
+	return m, nil
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -109,71 +190,73 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.menu {
+			return m.menuKey(msg)
+		}
 		if msg.Type == tea.KeyCtrlC || msg.String() == "q" {
 			m.quitting = true
-			m.closeConnections()
-			return m, tea.Quit
+			c := m.conn
+			m.conn = nil
+			return m, tea.Batch(closeCmd(c), tea.Quit)
 		}
 
 	case errorMsg:
-		// Update failed mid-way (download / transient error after retries).
-		// Priority: let the user into the game. Show the fail screen, then
-		// launch WITHOUT cleanup (partial download must not trigger mirror).
-		m.err = nil
-		m.failed = true
-		m.closeConnections()
-		return m, tea.Sequence(delayCmd(failNoticeDelay), launchGameCmd(m.cfg), tea.Quit)
+		// Update failed mid-way, automatic retries exhausted (or a permanent
+		// error). Let the player choose; a partial sync never runs cleanup.
+		m.drainProgress()
+		return m, m.showMenu(failReason(msg.err), msg.err)
 
 	case retryMsg:
 		m.status = fmt.Sprintf("Сервер обновлений не отвечает, попытка %d/%d...", msg.attempt, maxConnectAttempts)
 		a := msg.attempt
-		return m, tea.Tick(retryDelay, func(time.Time) tea.Msg { return startConnectMsg{a} })
+		return m, tea.Tick(retryDelay(a-1), func(time.Time) tea.Msg { return startConnectMsg{a} })
 
 	case startConnectMsg:
 		m.status = fmt.Sprintf("Подключение к серверу (попытка %d/%d)...", msg.attempt, maxConnectAttempts)
 		return m, connectCmd(m.cfg, msg.attempt)
 
 	case connectFailedMsg:
-		m.err = nil
-		m.failed = true
-		return m, tea.Sequence(delayCmd(failNoticeDelay), launchGameCmd(m.cfg), tea.Quit)
+		return m, m.showMenu("Сервер обновлений не отвечает", msg.err)
 
 	case filesListedMsg:
 		m.conn = msg.conn
 		m.listingComplete = msg.complete
+		m.walkErr = msg.walkErr
 		m.files = msg.files
 		m.allEntries = msg.allEntries
 		m.totalSize = msg.totalSize
 		m.startTime = time.Now()
 		m.updateBarWidths()
 		if len(m.files) == 0 {
-			m.status = "Все файлы актуальны. Запуск..."
-			return m, tea.Sequence(m.syncAndLaunch(), tea.Quit)
+			return m, m.finishSync("Все файлы актуальны. Запуск...")
 		}
 		m.status = fmt.Sprintf("Найдено %d файлов (%.2f MB)", len(m.files), float64(m.totalSize)/1024/1024)
 		m.currentFileSize = fileSize(m.files[0].Info)
 		return m, tea.Batch(m.downloadNext(), tickCmd())
 
 	case progressTickMsg:
+		if m.menu {
+			return m, nil // download over: stop the tick loop
+		}
 		m.pollProgress()
 		return m, tickCmd()
 
 	case fileDownloadedMsg:
 		m.drainProgress()
+		var closeOld tea.Cmd
 		if msg.conn != nil {
 			// The download reconnected: the old connection is dead, adopt the new one.
-			m.conn.Close()
+			closeOld = closeCmd(m.conn)
 			m.conn = msg.conn
 		}
 		m.currentIdx++
 		if m.currentIdx >= len(m.files) {
-			m.status = "Загрузка завершена. Запуск..."
-			return m, tea.Sequence(m.syncAndLaunch(), tea.Quit)
+			return m, tea.Batch(closeOld, m.finishSync("Загрузка завершена. Запуск..."))
 		}
 		m.currentFileDown = 0
 		m.currentFileSize = fileSize(m.files[m.currentIdx].Info)
 		m.updateBarWidths()
-		return m, m.downloadNext()
+		return m, tea.Batch(closeOld, m.downloadNext())
 	}
 	return m, nil
 }
@@ -182,15 +265,10 @@ func (m model) View() string {
 	if m.quitting {
 		return ""
 	}
-	if m.failed {
-		return m.failView()
+	if m.menu {
+		return m.menuView()
 	}
 	return m.progressView()
-}
-
-func (m *model) closeConnections() {
-	m.conn.Close()
-	m.conn = nil
 }
 
 // addProgress accounts n freshly downloaded bytes on both bars.

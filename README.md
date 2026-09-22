@@ -8,8 +8,9 @@ committed at the repo root.
 
 Set the Steam launch option for the game once. On every "Play" press, `curl -z`
 conditionally fetches the latest exe from this repo and runs it; the exe syncs
-the mods and starts the game. If the update server is unreachable the exe retries
-a few times, then shows a notice and launches the game anyway (no update).
+the mods and starts the game. If the update server is unreachable or the sync
+breaks, the exe retries automatically (downloads resume), then shows a menu:
+`[Enter]` launch the game anyway, `[R]` retry, `[Esc]` exit.
 
 ### Windrose
 
@@ -38,7 +39,7 @@ Syncs `…/modpacks/Valheim/` 1:1 into the Valheim install. Cleanup restricted t
 ## Architecture
 
 - `engine/` — shared logic: SFTP connect+retry, walk/diff, resumable downloads
-  (`.part` + `.meta` sidecar), mirror cleanup, TUI (progress + fail screen), launch.
+  (`.part` + `.meta` sidecar), mirror cleanup, TUI (progress + fail menu), launch.
 - `server.go` — wires the SFTP connection settings (server, login, password,
   `RemoteBase`, pinned `HostKey`) into `engine.ServerConfig`. The values are
   empty in source and **injected at build time** via `-ldflags -X` from a local,
