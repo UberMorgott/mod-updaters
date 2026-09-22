@@ -54,8 +54,8 @@ func (m model) progressView() string {
 	maxFileLen := max(contentWidth-15, 20)
 	if m.currentIdx < len(m.files) {
 		fileName = filepath.Base(m.files[m.currentIdx].RemotePath)
-		if len(fileName) > maxFileLen {
-			fileName = fileName[:maxFileLen-3] + "..."
+		if r := []rune(fileName); len(r) > maxFileLen {
+			fileName = string(r[:maxFileLen-3]) + "..." // cut by runes: names may be Cyrillic
 		}
 	}
 	lines = append(lines, statusStyled.Render("Файл: "+fileName))

@@ -11,14 +11,12 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/pkg/sftp"
-	"golang.org/x/crypto/ssh"
 )
 
 const (
-	downloadBufSize     = 128 * 1024 // 128 KiB copy buffer
-	maxDownloadRetries  = 3          // reconnect+resume attempts on transient mid-file error
-	downloadRetryBackof = 2 * time.Second
+	downloadBufSize      = 128 * 1024 // 128 KiB copy buffer
+	maxDownloadRetries   = 3          // reconnect+resume attempts on transient mid-file error
+	downloadRetryBackoff = 2 * time.Second
 )
 
 // downloadNext returns a tea.Cmd that downloads the current file, reporting
@@ -30,19 +28,20 @@ func (m *model) downloadNext() tea.Cmd {
 
 	file := m.files[m.currentIdx]
 	cfg := m.cfg
-	client := m.sftp
+	c := m.conn
 	ch := make(chan uint64, 1000)
 	m.progressChan = ch
 
 	return func() tea.Msg {
 		defer close(ch)
-		if client == nil {
-			return errorMsg{fmt.Errorf("нет SFTP соединения")}
+		if c == nil {
+			return errorMsg{errors.New("нет SFTP соединения")}
 		}
-		if err := downloadFile(cfg, client, file, ch); err != nil {
+		newConn, err := downloadFile(cfg, c, file, ch)
+		if err != nil {
 			return errorMsg{err}
 		}
-		return fileDownloadedMsg{}
+		return fileDownloadedMsg{conn: newConn}
 	}
 }
 
@@ -55,8 +54,8 @@ func writeMeta(partPath string, info os.FileInfo) error {
 	return os.WriteFile(metaPath(partPath), []byte(content), 0644)
 }
 
-// readMeta reads a sidecar meta and reports whether it matches the given remote
-// info (size + mtime, second precision).
+// metaMatches reads a sidecar meta and reports whether it matches the given
+// remote info (size + mtime, second precision).
 func metaMatches(partPath string, info os.FileInfo) bool {
 	data, err := os.ReadFile(metaPath(partPath))
 	if err != nil {
@@ -71,118 +70,108 @@ func metaMatches(partPath string, info os.FileInfo) bool {
 	if err1 != nil || err2 != nil {
 		return false
 	}
-	return size == info.Size() && mtime == info.ModTime().Truncate(time.Second).Unix()
+	return size == info.Size() && mtime == info.ModTime().Unix()
+}
+
+// partOffset returns how many bytes of the .part can be resumed from: its
+// size, or 0 if it is missing or larger than the remote file (stale).
+func partOffset(partPath string, remoteSize int64) int64 {
+	st, err := os.Stat(partPath)
+	if err != nil || st.Size() > remoteSize {
+		return 0
+	}
+	return st.Size()
 }
 
 // downloadFile performs a resumable download of one entry. It resumes from an
 // existing matching .part, retries transient mid-file errors with reconnect +
 // resume, then on success verifies size, renames to final, sets mtime, and
 // removes the meta sidecar.
-func downloadFile(cfg Config, client *sftp.Client, file sftpEntry, ch chan<- uint64) error {
+//
+// If a retry had to open a new connection and the download then succeeded, that
+// connection is returned (the caller owns it and should use it from now on);
+// otherwise the returned conn is nil.
+func downloadFile(cfg Config, c *conn, file sftpEntry, ch chan<- uint64) (*conn, error) {
 	localPath := file.LocalPath
 	partPath := localPath + ".part"
 
 	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Decide whether we can resume: .part exists AND meta matches current remote.
 	var startOffset int64
-	if st, err := os.Stat(partPath); err == nil && metaMatches(partPath, file.Info) {
-		startOffset = st.Size()
-		if startOffset > file.Info.Size() {
-			// Stale/oversized part — discard and start fresh.
-			startOffset = 0
-		}
+	if metaMatches(partPath, file.Info) {
+		startOffset = partOffset(partPath, file.Info.Size())
 	}
 	if startOffset == 0 {
 		// Fresh start: drop any stale part/meta and write a fresh meta.
 		_ = os.Remove(partPath)           // may not exist
 		_ = os.Remove(metaPath(partPath)) // may not exist
 		if err := writeMeta(partPath, file.Info); err != nil {
-			return err
+			return nil, err
 		}
-	}
-	// Report already-present bytes so the overall bar reflects resumed progress.
-	if startOffset > 0 {
+	} else {
+		// Report already-present bytes so the overall bar reflects resumed progress.
 		ch <- uint64(startOffset)
 	}
 
-	// Connections opened for retries are closed before opening the next one
-	// (and the last one on return), so at most one extra connection is alive.
-	var retrySSH *ssh.Client
-	var retrySFTP *sftp.Client
-	defer func() {
-		if retrySFTP != nil {
-			_ = retrySFTP.Close()
-		}
-		if retrySSH != nil {
-			_ = retrySSH.Close()
-		}
-	}()
+	// A connection opened for a retry replaces the previous retry connection
+	// (closed first), so at most one extra connection is alive at a time.
+	var retryConn *conn
 
 	var lastErr error
 	for attempt := range maxDownloadRetries {
 		if attempt > 0 {
 			// Reconnect and re-resume from however much is on disk now.
-			time.Sleep(downloadRetryBackof)
-			if retrySFTP != nil {
-				_ = retrySFTP.Close()
-				retrySFTP = nil
-			}
-			if retrySSH != nil {
-				_ = retrySSH.Close()
-				retrySSH = nil
-			}
-			newSSH, newSFTP, derr := dial(cfg.Server)
+			time.Sleep(downloadRetryBackoff)
+			retryConn.Close()
+			retryConn = nil
+			nc, derr := dial(cfg.Server)
 			if derr != nil {
 				lastErr = derr
 				continue
 			}
-			retrySSH, retrySFTP = newSSH, newSFTP
-			client = newSFTP
-			if st, serr := os.Stat(partPath); serr == nil {
-				startOffset = st.Size()
-				if startOffset > file.Info.Size() {
-					startOffset = 0
-				}
-			} else {
-				startOffset = 0
-			}
+			retryConn, c = nc, nc
+			startOffset = partOffset(partPath, file.Info.Size())
 		}
 
-		err := copyFromOffset(client, file, partPath, startOffset, ch)
-		if err == nil {
+		lastErr = copyFromOffset(c, file, partPath, startOffset, ch)
+		if lastErr == nil {
 			break
 		}
-		lastErr = err
 		// On the next loop, we will reconnect and resume.
 	}
 
-	// Verify the part is complete; if the loop exhausted with an error, surface it.
+	// Verify the part is complete; if not and the loop exhausted with an error,
+	// surface that error.
 	st, err := os.Stat(partPath)
-	if err != nil {
-		if lastErr != nil {
-			return lastErr
-		}
-		return err
-	}
-	if st.Size() != file.Info.Size() {
-		if lastErr != nil {
-			return lastErr
-		}
-		return fmt.Errorf("неполная загрузка %s: %d/%d байт",
+	switch {
+	case err == nil && st.Size() == file.Info.Size():
+		err = finalize(partPath, localPath, file.Info.ModTime())
+	case lastErr != nil:
+		err = lastErr
+	case err == nil:
+		err = fmt.Errorf("неполная загрузка %s: %d/%d байт",
 			filepath.Base(localPath), st.Size(), file.Info.Size())
 	}
+	if err != nil {
+		retryConn.Close()
+		return nil, err
+	}
+	return retryConn, nil
+}
 
-	// Complete: finalize.
-	_ = os.Remove(localPath) // ensure rename can overwrite on Windows; may not exist
+// finalize moves a complete .part into place and stamps the remote mtime.
+// os.Rename replaces an existing file on Windows too, so the old version stays
+// intact if the rename fails.
+func finalize(partPath, localPath string, mtime time.Time) error {
 	if err := os.Rename(partPath, localPath); err != nil {
 		return fmt.Errorf("rename %s: %w", filepath.Base(localPath), err)
 	}
 	_ = os.Remove(metaPath(partPath)) // best-effort: orphan meta is ignored without its .part
 	// mtime must match remote, otherwise needsUpdate re-downloads next run.
-	if err := os.Chtimes(localPath, time.Now(), file.Info.ModTime()); err != nil {
+	if err := os.Chtimes(localPath, time.Now(), mtime); err != nil {
 		return fmt.Errorf("chtimes %s: %w", filepath.Base(localPath), err)
 	}
 	return nil
@@ -191,8 +180,8 @@ func downloadFile(cfg Config, client *sftp.Client, file sftpEntry, ch chan<- uin
 // copyFromOffset opens the remote file, seeks to offset, appends to the .part
 // file from there, streaming progress. Returns an error on any read/write
 // failure (treated as transient by the caller until retries are exhausted).
-func copyFromOffset(client *sftp.Client, file sftpEntry, partPath string, offset int64, ch chan<- uint64) error {
-	src, err := client.Open(file.RemotePath)
+func copyFromOffset(c *conn, file sftpEntry, partPath string, offset int64, ch chan<- uint64) error {
+	src, err := c.sftp.Open(file.RemotePath)
 	if err != nil {
 		return err
 	}
@@ -234,8 +223,5 @@ func copyFromOffset(client *sftp.Client, file sftpEntry, partPath string, offset
 			return rErr
 		}
 	}
-	if err := dst.Close(); err != nil {
-		return err
-	}
-	return nil
+	return dst.Close()
 }

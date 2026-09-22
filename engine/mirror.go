@@ -10,12 +10,15 @@ import (
 
 // syncAndLaunch creates remote-present directories, runs the configured cleanup,
 // then launches the game. The empty-listing safety guard short-circuits all
-// cleanup (just launch) if the walk yielded zero entries.
+// cleanup (just launch) if the walk yielded zero entries; an incomplete listing
+// (walk error / rejected entry) skips cleanup too.
 func (m *model) syncAndLaunch() tea.Cmd {
 	cfg := m.cfg
 	allEntries := m.allEntries
+	complete := m.listingComplete
+	c := m.conn
 	return func() tea.Msg {
-		defer m.closeConnections()
+		c.Close()
 
 		// Safety: if the remote listing is empty (remote dir missing or
 		// unreachable), do NOT run any cleanup — that would wipe installed
@@ -32,15 +35,10 @@ func (m *model) syncAndLaunch() tea.Cmd {
 			}
 		}
 
-		localRootAbs, _ := filepath.Abs(".")
-		sftpDirs := buildSFTPDirSet(allEntries)
-
-		for _, spec := range cfg.Cleanup {
-			switch spec.Mode {
-			case MirrorFiles:
-				mirrorFiles(localRootAbs, spec.Path, allEntries)
-			case MirrorSubdirs:
-				mirrorSubdirs(localRootAbs, spec.Path, sftpDirs)
+		if complete {
+			localRootAbs, err := filepath.Abs(".")
+			if err == nil {
+				runCleanup(localRootAbs, cfg.Cleanup, allEntries)
 			}
 		}
 
@@ -49,13 +47,32 @@ func (m *model) syncAndLaunch() tea.Cmd {
 	}
 }
 
-// buildSFTPDirSet returns the set of forward-slash relative paths that are
-// directories on SFTP this run.
+// runCleanup applies every Cleanup spec under localRoot against the SFTP listing.
+func runCleanup(localRoot string, specs []CleanupSpec, allEntries []sftpEntry) {
+	sftpDirs := buildSFTPDirSet(allEntries)
+	for _, spec := range specs {
+		switch spec.Mode {
+		case MirrorFiles:
+			mirrorFiles(localRoot, spec.Path, allEntries)
+		case MirrorSubdirs:
+			mirrorSubdirs(localRoot, spec.Path, sftpDirs)
+		}
+	}
+}
+
+// pathKey normalizes a forward-slash relative path for keep-set lookups. The
+// game dirs live on case-insensitive NTFS: a local "foo.dll" IS the remote
+// "Foo.dll" (the downloader already treated it as present), so it must never
+// be deleted as an orphan.
+func pathKey(relSlash string) string { return strings.ToLower(relSlash) }
+
+// buildSFTPDirSet returns the set of (pathKey-normalized) forward-slash
+// relative paths that are directories on SFTP this run.
 func buildSFTPDirSet(entries []sftpEntry) map[string]struct{} {
 	set := make(map[string]struct{})
 	for _, e := range entries {
 		if e.Info.IsDir() {
-			set[e.RelSlash] = struct{}{}
+			set[pathKey(e.RelSlash)] = struct{}{}
 		}
 	}
 	return set
@@ -71,12 +88,9 @@ func mirrorFiles(localRoot, cleanupRel string, allEntries []sftpEntry) {
 	// Keep-set: every SFTP entry under the cleanup root, expressed relative to
 	// that root in forward-slash form.
 	keep := make(map[string]struct{})
-	prefix := cleanupRel + "/"
+	prefix := pathKey(cleanupRel) + "/"
 	for _, e := range allEntries {
-		if e.RelSlash == cleanupRel {
-			continue // the root itself
-		}
-		if rel, ok := strings.CutPrefix(e.RelSlash, prefix); ok && rel != "" {
+		if rel, ok := strings.CutPrefix(pathKey(e.RelSlash), prefix); ok && rel != "" {
 			keep[rel] = struct{}{}
 		}
 	}
@@ -86,14 +100,17 @@ func mirrorFiles(localRoot, cleanupRel string, allEntries []sftpEntry) {
 // cleanDir recursively deletes any entry under base/rel whose forward-slash
 // relative path is not in keep. Surviving dirs are recursed into.
 func cleanDir(base, rel string, keep map[string]struct{}) {
-	entries, err := os.ReadDir(filepath.Join(base, rel))
+	entries, err := os.ReadDir(filepath.Join(base, filepath.FromSlash(rel)))
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		path := filepath.ToSlash(filepath.Join(rel, e.Name()))
-		if _, ok := keep[path]; !ok {
-			_ = os.RemoveAll(filepath.Join(base, rel, e.Name())) // best-effort cleanup
+		path := e.Name()
+		if rel != "" {
+			path = rel + "/" + e.Name()
+		}
+		if _, ok := keep[pathKey(path)]; !ok {
+			_ = os.RemoveAll(filepath.Join(base, filepath.FromSlash(path))) // best-effort cleanup
 		} else if e.IsDir() {
 			cleanDir(base, path, keep)
 		}
@@ -106,10 +123,6 @@ func cleanDir(base, rel string, keep map[string]struct{}) {
 // cleanupFullMirror/buildSFTPDirSet).
 func mirrorSubdirs(localRoot, cleanupRel string, sftpDirs map[string]struct{}) {
 	mirrorLocal := filepath.Join(localRoot, filepath.FromSlash(cleanupRel))
-	st, err := os.Stat(mirrorLocal)
-	if err != nil || !st.IsDir() {
-		return
-	}
 	entries, err := os.ReadDir(mirrorLocal)
 	if err != nil {
 		return
@@ -118,8 +131,7 @@ func mirrorSubdirs(localRoot, cleanupRel string, sftpDirs map[string]struct{}) {
 		if !e.IsDir() {
 			continue // never delete files at this level
 		}
-		relSlash := cleanupRel + "/" + e.Name()
-		if _, ok := sftpDirs[relSlash]; ok {
+		if _, ok := sftpDirs[pathKey(cleanupRel+"/"+e.Name())]; ok {
 			continue // matching dir on SFTP — keep
 		}
 		_ = os.RemoveAll(filepath.Join(mirrorLocal, e.Name())) // best-effort cleanup

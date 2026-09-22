@@ -8,15 +8,12 @@ import (
 
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/pkg/sftp"
-	"golang.org/x/crypto/ssh"
 )
 
 // model is the bubbletea model driving the updater TUI.
 type model struct {
 	cfg                              Config
-	sshClient                        *ssh.Client
-	sftp                             *sftp.Client
+	conn                             *conn
 	progressBar, fileProgressBar     progress.Model
 	progressChan                     chan uint64
 	status                           string
@@ -28,6 +25,7 @@ type model struct {
 	err                              error
 	quitting                         bool
 	failed                           bool // server unreachable → show the fail screen
+	listingComplete                  bool // walk finished without errors → cleanup allowed
 	startTime                        time.Time
 }
 
@@ -87,9 +85,9 @@ func connectCmd(cfg Config, attempt int) tea.Cmd {
 }
 
 // launchGameCmd wraps launchGame as a tea.Cmd.
-func (m *model) launchGameCmd() tea.Cmd {
+func launchGameCmd(cfg Config) tea.Cmd {
 	return func() tea.Msg {
-		launchGame(m.cfg)
+		launchGame(cfg)
 		return nil
 	}
 }
@@ -124,7 +122,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = nil
 		m.failed = true
 		m.closeConnections()
-		return m, tea.Sequence(delayCmd(failNoticeDelay), m.launchGameCmd(), tea.Quit)
+		return m, tea.Sequence(delayCmd(failNoticeDelay), launchGameCmd(m.cfg), tea.Quit)
 
 	case retryMsg:
 		m.status = fmt.Sprintf("Сервер обновлений не отвечает, попытка %d/%d...", msg.attempt, maxConnectAttempts)
@@ -138,49 +136,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectFailedMsg:
 		m.err = nil
 		m.failed = true
-		return m, tea.Sequence(delayCmd(failNoticeDelay), m.launchGameCmd(), tea.Quit)
+		return m, tea.Sequence(delayCmd(failNoticeDelay), launchGameCmd(m.cfg), tea.Quit)
 
 	case filesListedMsg:
-		m.sftp = msg.sftpClient
-		m.sshClient = msg.sshClient
+		m.conn = msg.conn
+		m.listingComplete = msg.complete
 		m.files = msg.files
 		m.allEntries = msg.allEntries
 		m.totalSize = msg.totalSize
 		m.startTime = time.Now()
 		m.updateBarWidths()
-		if m.totalSize == 0 {
+		if len(m.files) == 0 {
 			m.status = "Все файлы актуальны. Запуск..."
 			return m, tea.Sequence(m.syncAndLaunch(), tea.Quit)
 		}
 		m.status = fmt.Sprintf("Найдено %d файлов (%.2f MB)", len(m.files), float64(m.totalSize)/1024/1024)
-		if len(m.files) > 0 {
-			m.currentFileSize = fileSize(m.files[0].Info)
-		}
+		m.currentFileSize = fileSize(m.files[0].Info)
 		return m, tea.Batch(m.downloadNext(), tickCmd())
 
 	case progressTickMsg:
-		if m.progressChan == nil {
-			return m, tickCmd()
-		}
-		var got uint64
-		for {
-			select {
-			case n, ok := <-m.progressChan:
-				if !ok {
-					m.progressChan = nil
-					return m, tickCmd()
-				}
-				got += n
-			default:
-				if got > 0 {
-					m.downloaded = min(m.downloaded+got, m.totalSize)
-					m.currentFileDown = min(m.currentFileDown+got, m.currentFileSize)
-				}
-				return m, tickCmd()
-			}
-		}
+		m.pollProgress()
+		return m, tickCmd()
 
 	case fileDownloadedMsg:
+		m.drainProgress()
+		if msg.conn != nil {
+			// The download reconnected: the old connection is dead, adopt the new one.
+			m.conn.Close()
+			m.conn = msg.conn
+		}
 		m.currentIdx++
 		if m.currentIdx >= len(m.files) {
 			m.status = "Загрузка завершена. Запуск..."
@@ -205,12 +189,43 @@ func (m model) View() string {
 }
 
 func (m *model) closeConnections() {
-	if m.sftp != nil {
-		_ = m.sftp.Close()
+	m.conn.Close()
+	m.conn = nil
+}
+
+// addProgress accounts n freshly downloaded bytes on both bars.
+func (m *model) addProgress(n uint64) {
+	m.downloaded = min(m.downloaded+n, m.totalSize)
+	m.currentFileDown = min(m.currentFileDown+n, m.currentFileSize)
+}
+
+// pollProgress consumes whatever the running download has reported so far
+// without blocking. A closed channel (download finished) is dropped.
+func (m *model) pollProgress() {
+	for m.progressChan != nil {
+		select {
+		case n, ok := <-m.progressChan:
+			if !ok {
+				m.progressChan = nil
+				return
+			}
+			m.addProgress(n)
+		default:
+			return
+		}
 	}
-	if m.sshClient != nil {
-		_ = m.sshClient.Close()
+}
+
+// drainProgress counts the bytes still buffered in the finished download's
+// progress channel (closed by then), so no progress is lost between ticks.
+func (m *model) drainProgress() {
+	if m.progressChan == nil {
+		return
 	}
+	for n := range m.progressChan {
+		m.addProgress(n)
+	}
+	m.progressChan = nil
 }
 
 // Run is the engine entry point: validate config, then drive the TUI.

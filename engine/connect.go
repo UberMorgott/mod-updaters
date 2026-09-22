@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,20 +27,41 @@ type sftpEntry struct {
 	Info       os.FileInfo // remote file info
 }
 
+// conn is one SSH connection plus the SFTP session running over it.
+type conn struct {
+	ssh  *ssh.Client
+	sftp *sftp.Client
+}
+
+// Close closes the SFTP session and the SSH connection. Safe on a nil conn.
+func (c *conn) Close() {
+	if c == nil {
+		return
+	}
+	_ = c.sftp.Close() // best-effort: the SSH close below tears the session down anyway
+	_ = c.ssh.Close()
+}
+
 // --- bubbletea messages ---
 
 type errorMsg struct{ err error }
 
 type filesListedMsg struct {
-	sftpClient *sftp.Client
-	sshClient  *ssh.Client
+	conn       *conn
 	files      []sftpEntry // files needing download
 	allEntries []sftpEntry // every SFTP entry seen (files + dirs) — used for cleanup keep-set
 	totalSize  uint64
+	// complete is false when the walk hit an error or rejected an unsafe entry:
+	// the keep-set may then be missing files, so cleanup must not run.
+	complete bool
 }
 
 type progressTickMsg struct{}
-type fileDownloadedMsg struct{}
+
+// fileDownloadedMsg — the current file is done. conn is non-nil when the
+// download had to reconnect: the model adopts it in place of the old (broken)
+// connection so the next files don't each pay for a reconnect.
+type fileDownloadedMsg struct{ conn *conn }
 
 // retryMsg — a connection attempt failed but spare attempts remain.
 type retryMsg struct {
@@ -58,7 +81,7 @@ type connectFailedMsg struct{ err error }
 // fall back to an insecure callback.
 func sshConfig(s ServerConfig) (*ssh.ClientConfig, error) {
 	if s.HostKey == "" {
-		return nil, fmt.Errorf("no pinned host key configured")
+		return nil, errors.New("no pinned host key configured")
 	}
 	_, _, key, _, _, err := ssh.ParseKnownHosts([]byte(s.HostKey))
 	if err != nil {
@@ -74,21 +97,21 @@ func sshConfig(s ServerConfig) (*ssh.ClientConfig, error) {
 }
 
 // dial opens an SSH + SFTP connection to the configured server.
-func dial(s ServerConfig) (*ssh.Client, *sftp.Client, error) {
+func dial(s ServerConfig) (*conn, error) {
 	cfg, err := sshConfig(s)
 	if err != nil {
-		return nil, nil, fmt.Errorf("SSH: %w", err)
+		return nil, fmt.Errorf("SSH: %w", err)
 	}
 	sshClient, err := ssh.Dial("tcp", s.Host, cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("SSH: %w", err)
+		return nil, fmt.Errorf("SSH: %w", err)
 	}
 	sftpClient, err := sftp.NewClient(sshClient)
 	if err != nil {
 		_ = sshClient.Close()
-		return nil, nil, fmt.Errorf("SFTP: %w", err)
+		return nil, fmt.Errorf("SFTP: %w", err)
 	}
-	return sshClient, sftpClient, nil
+	return &conn{ssh: sshClient, sftp: sftpClient}, nil
 }
 
 // remoteRoot returns the absolute SFTP root for this config (no trailing slash).
@@ -96,57 +119,90 @@ func remoteRoot(cfg Config) string {
 	return strings.TrimRight(cfg.Server.RemoteBase+cfg.RemoteSubdir, "/")
 }
 
+// localRel maps a walked remote path to a local path relative to the game root.
+// The file names come from the server, so anything that could escape the game
+// root (".." elements, absolute/drive paths, backslashes, ':' streams, reserved
+// Windows names like NUL) is rejected — filepath.Localize does all of that.
+// ok is false for the root itself and for rejected paths.
+func localRel(root, remotePath string) (relSlash, rel string, ok bool) {
+	relSlash, found := strings.CutPrefix(remotePath, root+"/")
+	if !found {
+		return "", "", false
+	}
+	rel, err := filepath.Localize(relSlash)
+	if err != nil || rel == "." {
+		return "", "", false
+	}
+	return relSlash, rel, true
+}
+
 // doConnect performs a single connection attempt and builds the file lists.
 // Whole-tree 1:1: walk remoteRoot, map each remote rel path to the same local
 // rel path under the game root (cwd), download if missing or needsUpdate.
 func doConnect(cfg Config) (filesListedMsg, error) {
-	sshClient, sftpClient, err := dial(cfg.Server)
+	localRootAbs, err := filepath.Abs(".")
+	if err != nil {
+		return filesListedMsg{}, err
+	}
+	c, err := dial(cfg.Server)
 	if err != nil {
 		return filesListedMsg{}, err
 	}
 
-	localRootAbs, _ := filepath.Abs(".")
 	root := remoteRoot(cfg)
-
 	var all, toDownload []sftpEntry
 	var totalSize uint64
+	complete := true
 
-	walker := sftpClient.Walk(root)
+	walker := c.sftp.Walk(root)
 	for walker.Step() {
 		if walker.Err() != nil {
+			// Unreadable entry/dir: keep going (download what we can) but the
+			// listing is partial, so cleanup is disabled for this run.
+			complete = false
 			continue
 		}
 		rPath := walker.Path()
-		info := walker.Stat()
-
-		rel := strings.TrimPrefix(rPath, root)
-		rel = strings.TrimPrefix(rel, "/")
-		if rel == "" {
+		if rPath == root {
 			continue
 		}
-		relSlash := filepath.ToSlash(rel)
-		localPath := filepath.Join(localRootAbs, filepath.FromSlash(rel))
+		info := walker.Stat()
 
-		entry := sftpEntry{RemotePath: rPath, LocalPath: localPath, RelSlash: relSlash, Info: info}
+		relSlash, rel, ok := localRel(root, rPath)
+		if !ok {
+			// Unsafe name from the server — never map it to a local path.
+			complete = false
+			if info.IsDir() {
+				walker.SkipDir()
+			}
+			continue
+		}
+
+		entry := sftpEntry{
+			RemotePath: rPath,
+			LocalPath:  filepath.Join(localRootAbs, rel),
+			RelSlash:   relSlash,
+			Info:       info,
+		}
 		all = append(all, entry)
 
 		if info.IsDir() {
 			continue
 		}
 
-		local, lerr := os.Stat(localPath)
-		if os.IsNotExist(lerr) || (lerr == nil && needsUpdate(local, info)) {
+		local, lerr := os.Stat(entry.LocalPath)
+		if errors.Is(lerr, fs.ErrNotExist) || (lerr == nil && needsUpdate(local, info)) {
 			toDownload = append(toDownload, entry)
 			totalSize += fileSize(info)
 		}
 	}
 
 	return filesListedMsg{
-		sftpClient: sftpClient,
-		sshClient:  sshClient,
+		conn:       c,
 		files:      toDownload,
 		allEntries: all,
 		totalSize:  totalSize,
+		complete:   complete,
 	}, nil
 }
 
